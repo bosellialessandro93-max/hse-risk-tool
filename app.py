@@ -17,7 +17,7 @@ def calculate_risk(data):
     severity = sum(weights.get(x.strip().lower(), 0) for x in data["nc_types"])
     ncScore = min((data["num_nc"] * 2 + severity), 100)
 
-    # Stop Work bilanciato (rischio + cultura)
+    # Stop Work bilanciato
     stop_risk = min(data["stopworks"] * 10, 100)
     stop_bonus = min(data["stopworks"] * 2, 10)
     stopWorkScore = stop_risk - stop_bonus
@@ -30,7 +30,6 @@ def calculate_risk(data):
 
     awarenessMitigation = min(data["awareness"] * 0.1, 15)
 
-    # fase cantiere
     fase_weights = {
         "cantierizzazione": 20,
         "costruzione": 40,
@@ -86,8 +85,6 @@ def suggest_actions(level):
 
 st.title("🦺 HSE Risk Tool PRO")
 
-sito = st.selectbox("Seleziona sito", ["La Spezia", "Altro sito", "Test"])
-
 fase = st.selectbox(
     "Fase cantiere",
     ["cantierizzazione", "costruzione", "commissioning", "punch list"]
@@ -128,14 +125,11 @@ if st.button("Calcola rischio"):
                 nc_themes.append(parts[0].strip())
                 nc_types.append(parts[1].strip())
 
-    # Excel parsing
     if uploaded_file is not None:
         df_excel = pd.read_excel(uploaded_file)
 
         if "Stato" in df_excel.columns:
-            crit_open = df_excel[
-                df_excel["Stato"].str.lower() == "aperto"
-            ]
+            crit_open = df_excel[df_excel["Stato"].str.lower() == "aperto"]
             criticalities = len(crit_open)
 
     data = {
@@ -154,18 +148,10 @@ if st.button("Calcola rischio"):
 
     actions = suggest_actions(level)
 
-    # ==========================================
-    # OUTPUT
-    # ==========================================
-
     st.subheader("📊 Risultato")
 
     st.metric("Risk Index", round(risk))
     st.metric("Livello rischio", level)
-
-    # ==========================================
-    # DASHBOARD
-    # ==========================================
 
     st.subheader("📈 Dashboard")
 
@@ -175,10 +161,6 @@ if st.button("Calcola rischio"):
     })
 
     st.bar_chart(df.set_index("Componente"))
-
-    # ==========================================
-    # DRIVER
-    # ==========================================
 
     st.subheader("🚨 Driver principali")
 
@@ -196,18 +178,10 @@ if st.button("Calcola rischio"):
     for d in drivers:
         st.write("-", d)
 
-    # ==========================================
-    # AZIONI
-    # ==========================================
-
     st.subheader("🎯 Azioni suggerite")
 
     for a in actions:
         st.write("-", a)
-
-    # ==========================================
-    # SPIEGAZIONE
-    # ==========================================
 
     st.subheader("🧠 Spiegazione")
 
@@ -227,32 +201,11 @@ if st.button("Calcola rischio"):
 
     st.write(explanation)
 
-    # ==========================================
-    # WARNING
-    # ==========================================
-
     if stopworks >= num_nc and stopworks > 0:
         st.warning("⚠️ Molti Stop Work → verificare coerenza con NC")
 
     if criticalities > 5:
         st.warning("⚠️ Backlog criticità elevato")
-
-    # ==========================================
-    # STORE MULTI SITO
-    # ==========================================
-
-    st.subheader("🌍 Dati sito")
-
-    df_store = pd.DataFrame({
-        "Sito": [sito],
-        "Rischio": [round(risk)]
-    })
-
-    st.write(df_store)
-
-    # ==========================================
-    # INSIGHT AI (rule-based)
-    # ==========================================
 
     st.subheader("🤖 Insight automatici")
 
@@ -264,3 +217,4 @@ if st.button("Calcola rischio"):
 
     if criticalities > 5:
         st.write("- Ridurre backlog criticità")
+

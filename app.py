@@ -235,4 +235,3 @@ if st.button("Calcola rischio"):
         buffer.getvalue(),
         "HSE_Risk_Report.pptx"
     )
-``

@@ -1,5 +1,7 @@
 import streamlit as st
 import pandas as pd
+from pptx import Presentation
+from pptx.util import Inches
 
 # ==========================================
 # CALCOLO RISCHIO
@@ -17,7 +19,6 @@ def calculate_risk(data):
     severity = sum(weights.get(x.strip().lower(), 0) for x in data["nc_types"])
     ncScore = min((data["num_nc"] * 2 + severity), 100)
 
-    # Stop Work bilanciato
     stop_risk = min(data["stopworks"] * 10, 100)
     stop_bonus = min(data["stopworks"] * 2, 10)
     stopWorkScore = stop_risk - stop_bonus
@@ -65,18 +66,54 @@ def calculate_risk(data):
 
 
 # ==========================================
-# AZIONI
+# PPT REPORT
 # ==========================================
 
-def suggest_actions(level):
-    actions_map = {
-        "Basso": ["Monitoraggio continuo", "Sensibilizzazioni"],
-        "Medio basso": ["Verifica NC", "Formazione mirata"],
-        "Medio": ["Analisi cause", "Aumentare ispezioni", "Briefing appaltatori"],
-        "Alto": ["Audit HSE", "Piano correttivo", "Revisione subappalti"],
-        "Critico": ["Escalation immediata", "Stop attività", "Indagine eventi"]
-    }
-    return actions_map[level]
+def generate_ppt(nome, risk, level, df):
+
+    prs = Presentation()
+
+    # Slide 1 - titolo
+    slide_layout = prs.slide_layouts[0]
+    slide = prs.slides.add_slide(slide_layout)
+
+    title = slide.shapes.title
+    subtitle = slide.placeholders[1]
+
+    title.text = "HSE Risk Report"
+    subtitle.text = f"Cantiere: {nome}"
+
+    # Slide 2 - risultato
+    slide_layout = prs.slide_layouts[1]
+    slide = prs.slides.add_slide(slide_layout)
+
+    slide.shapes.title.text = "Risultato"
+    content = slide.placeholders[1]
+
+    content.text = f"Risk Index: {round(risk)}\nLivello: {level}"
+
+    # Slide 3 - dashboard
+    slide_layout = prs.slide_layouts[5]
+    slide = prs.slides.add_slide(slide_layout)
+
+    slide.shapes.title.text = "Componenti rischio"
+
+    left = Inches(1)
+    top = Inches(1.5)
+
+    rows = len(df) + 1
+    cols = 2
+
+    table = slide.shapes.add_table(rows, cols, left, top, Inches(6), Inches(3)).table
+
+    table.cell(0, 0).text = "Componente"
+    table.cell(0, 1).text = "Valore"
+
+    for i, row in df.iterrows():
+        table.cell(i + 1, 0).text = str(row["Componente"])
+        table.cell(i + 1, 1).text = str(round(row["Valore"]))
+
+    return prs
 
 
 # ==========================================
@@ -84,6 +121,8 @@ def suggest_actions(level):
 # ==========================================
 
 st.title("🦺 HSE Risk Tool PRO")
+
+nome_cantiere = st.text_input("Nome cantiere")
 
 fase = st.selectbox(
     "Fase cantiere",
@@ -146,10 +185,7 @@ if st.button("Calcola rischio"):
 
     risk, level, ncScore, stopWorkScore, criticalityScore, inspectionScore, complexityScore = calculate_risk(data)
 
-    actions = suggest_actions(level)
-
     st.subheader("📊 Risultato")
-
     st.metric("Risk Index", round(risk))
     st.metric("Livello rischio", level)
 
@@ -162,59 +198,21 @@ if st.button("Calcola rischio"):
 
     st.bar_chart(df.set_index("Componente"))
 
-    st.subheader("🚨 Driver principali")
+    # ==========================================
+    # DOWNLOAD PPT
+    # ==========================================
 
-    drivers = []
+    prs = generate_ppt(nome_cantiere, risk, level, df)
+    
+    ppt_bytes = None
+    from io import BytesIO
+    buf = BytesIO()
+    prs.save(buf)
+    ppt_bytes = buf.getvalue()
 
-    if stopworks > 2:
-        drivers.append("Stop Work elevati")
-
-    if criticalities > 5:
-        drivers.append("Criticità aperte elevate")
-
-    if num_nc > 3:
-        drivers.append("Numero NC significativo")
-
-    for d in drivers:
-        st.write("-", d)
-
-    st.subheader("🎯 Azioni suggerite")
-
-    for a in actions:
-        st.write("-", a)
-
-    st.subheader("🧠 Spiegazione")
-
-    explanation = f"Il rischio è {level}. "
-
-    if stopworks > 2:
-        explanation += "Stop Work indicano attività preventiva. "
-
-    if criticalities > 5:
-        explanation += "Presenza di backlog criticità. "
-
-    if num_nc > 0:
-        explanation += "Le NC contribuiscono al rischio. "
-
-    if inspections > 20:
-        explanation += "Buon controllo operativo. "
-
-    st.write(explanation)
-
-    if stopworks >= num_nc and stopworks > 0:
-        st.warning("⚠️ Molti Stop Work → verificare coerenza con NC")
-
-    if criticalities > 5:
-        st.warning("⚠️ Backlog criticità elevato")
-
-    st.subheader("🤖 Insight automatici")
-
-    if "quota" in " ".join(nc_themes):
-        st.write("- Rafforzare formazione lavori in quota")
-
-    if stopworks > 3 and criticalities > 5:
-        st.write("- Verificare conversione Stop Work → azioni reali")
-
-    if criticalities > 5:
-        st.write("- Ridurre backlog criticità")
-
+    st.download_button(
+        label="📥 Scarica Report PPT",
+        data=ppt_bytes,
+        file_name="HSE_Risk_Report.pptx",
+        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    )

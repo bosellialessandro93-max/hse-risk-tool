@@ -6,7 +6,7 @@ from io import BytesIO
 
 
 # ==========================================
-# CALCOLO RISCHIO
+# CALCOLO RISCHIO (MIGLIORATO)
 # ==========================================
 def calculate_risk(data):
 
@@ -15,18 +15,27 @@ def calculate_risk(data):
     severity = sum(weights.get(x.lower(), 0) for x in data["nc_types"])
     ncScore = min(data["num_nc"] * 2 + severity, 100)
 
-    stop_risk = min(data["stopworks"] * 10, 100)
-    stop_bonus = min(data["stopworks"] * 2, 10)
-    stopScore = stop_risk - stop_bonus
+    # STOP WORK (evento + cultura separati)
+    stop_event = data["stopworks"] * 8
+    stop_culture = min(data["stopworks"] * 2, 10)
+    stopScore = min(stop_event, 100) - stop_culture
 
-    critScore = min(data["criticalities"] * 10, 100)
+    # CRITICITÀ PESATE
+    critScore = min(
+        data["crit_open"] * 12 +
+        data["crit_late"] * 15 +
+        data["crit_ontime"] * 5,
+        100
+    )
 
-    inspectionScore = max(10, 50 - data["inspections"] * 2)
+    # ISPEZIONI DINAMICHE
+    inspectionScore = max(10, 50 - data["inspections"] * 2 + data["num_nc"] * 1.5)
 
+    # COMPLESSITÀ
     complexity = data["app"] + data["sub"] * 1.5
     complexityScore = min(complexity * 5, 100)
 
-    awareness = min(data["awareness"] * 0.1, 15)
+    awareness_bonus = min(data["awareness"] * 0.1, 15)
 
     fase_weights = {
         "cantierizzazione": 20,
@@ -44,7 +53,7 @@ def calculate_risk(data):
         inspectionScore * 0.10 +
         complexityScore * 0.15 +
         faseScore * 0.10
-    ) - awareness
+    ) - awareness_bonus
 
     risk = max(0, min(100, risk))
 
@@ -63,56 +72,86 @@ def calculate_risk(data):
 
 
 # ==========================================
-# AZIONI INTELLIGENTI (STABILI)
+# AZIONI INTELLIGENTI (LOGICA AVANZATA)
 # ==========================================
-def generate_actions(data, level, nc_types, nc_themes, stopScore, critScore):
+def generate_actions(data):
 
     actions = []
 
-    themes_text = " ".join(nc_themes).lower()
+    nc = data["num_nc"]
+    stop = data["stopworks"]
+    inspections = data["inspections"]
 
-    # CRITICITÀ
-    if data["criticalities"] > 5:
-        actions.append("🔴 HIGH → backlog criticità elevato: attivare piano di chiusura")
+    crit_open = data["crit_open"]
+    crit_late = data["crit_late"]
+    crit_ontime = data["crit_ontime"]
 
-        if data["stopworks"] > 0:
-            actions.append("🔴 Stop Work NON convertite in azioni efficaci")
+    awareness = data["awareness"]
 
-    # NC TEMATICHE
-    if "elettrico" in themes_text:
-        actions.append("🟡 Rafforzare controlli rischio elettrico")
+    total_crit = crit_open + crit_late + crit_ontime
+    late_ratio = (crit_late / total_crit) if total_crit > 0 else 0
 
-    if "quota" in themes_text:
-        actions.append("🟡 Migliorare sicurezza lavori in quota")
+    # =====================
+    # CORRELAZIONE PRINCIPALE
+    # =====================
+    if nc > 5 and stop > 3:
+        actions.append(("MUST HAVE", "🔴 Eventi elevati → aumento probabilità infortunio"))
+        actions.append(("MUST HAVE", "Aumentare ispezioni e sensibilizzazioni"))
 
-    if "dpi" in themes_text:
-        actions.append("🟡 Migliorare comportamento utilizzo DPI")
+    elif inspections > 20 and nc < 3 and stop < 2:
+        actions.append(("MUST HAVE", "🟢 Sistema sotto controllo"))
+        actions.append(("NICE TO HAVE", "Mantenere attuale livello di monitoraggio"))
 
-    # STOP WORK
-    if data["stopworks"] > data["num_nc"]:
-        actions.append("🟡 Disallineamento Stop Work / NC")
+    # =====================
+    # CRITICITÀ PERFORMANCE
+    # =====================
+    if late_ratio > 0.3:
+        actions.append(("MUST HAVE", "🔴 Alta % criticità risolte in ritardo"))
+        actions.append(("MUST HAVE", "Rafforzare processo chiusura azioni"))
 
-    if data["stopworks"] > 2:
-        actions.append("🟢 Cultura preventiva attiva")
+    if crit_open > 10:
+        actions.append(("MUST HAVE", "🔴 Troppe criticità aperte"))
+        actions.append(("MUST HAVE", "Piano straordinario di chiusura"))
 
-    # FASE
-    if data["fase"] == "commissioning":
-        actions.append("🔴 Fase commissioning → presidio HSE rafforzato")
+    if crit_ontime > crit_late:
+        actions.append(("NICE TO HAVE", "🟢 Buona capacità risoluzione criticità"))
+    
+    # =====================
+    # CONTROLLO
+    # =====================
+    if inspections < 5 and nc > 3:
+        actions.append(("MUST HAVE", "🔴 Controllo insufficiente"))
+        actions.append(("MUST HAVE", "Aumentare presenza HSE"))
 
-    # ISPEZIONI
-    if data["inspections"] < 5:
-        actions.append("🟡 Incrementare attività ispettiva")
+    if inspections > 25 and nc > 8:
+        actions.append(("NICE TO HAVE", "🟡 Controlli numerosi ma poco efficaci"))
 
-    if data["inspections"] > 30:
-        actions.append("🟢 Buon livello di controllo")
+    # =====================
+    # AWARENESS
+    # =====================
+    if awareness < inspections:
+        actions.append(("NICE TO HAVE", "Sensibilizzazione da aumentare"))
+
+    if awareness > 50 and nc < 3:
+        actions.append(("IDEA", "Alta awareness sta riducendo eventi"))
+
+    # =====================
+    # GARANTIRE MINIMO 3 OUTPUT
+    # =====================
+    if len(actions) < 3:
+        if nc == 0:
+            actions.append(("IDEA", "Nessuna NC: verificare reale capacità di rilevazione"))
+        if inspections > 0:
+            actions.append(("IDEA", "Continuare monitoraggio operativo"))
+        actions.append(("IDEA", "Rafforzare cultura preventiva"))
 
     return actions
 
 
 # ==========================================
-# PPT
+# PPT (MIGLIORATO)
 # ==========================================
-def generate_ppt(nome, risk, level, df, actions):
+def generate_ppt(nome, risk, level, df, actions, data):
 
     prs = Presentation()
 
@@ -124,11 +163,20 @@ def generate_ppt(nome, risk, level, df, actions):
     slide.shapes.title.text = "Risultato"
     slide.placeholders[1].text = f"Risk Index: {round(risk)} - {level}"
 
+    # KPI CRITICITÀ
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+    slide.shapes.title.text = "Gestione criticità"
+    slide.placeholders[1].text = (
+        f"Aperte: {data['crit_open']}\n"
+        f"Risolte in tempo: {data['crit_ontime']}\n"
+        f"Risolte in ritardo: {data['crit_late']}"
+    )
+
+    # DRIVER RISCHIO
     slide = prs.slides.add_slide(prs.slide_layouts[5])
     slide.shapes.title.text = "Driver rischio"
 
     table = slide.shapes.add_table(len(df) + 1, 2, Inches(1), Inches(1.5), Inches(6), Inches(3)).table
-
     table.cell(0, 0).text = "Componente"
     table.cell(0, 1).text = "Valore"
 
@@ -136,9 +184,15 @@ def generate_ppt(nome, risk, level, df, actions):
         table.cell(i + 1, 0).text = str(row["Componente"])
         table.cell(i + 1, 1).text = str(round(row["Valore"]))
 
+    # AZIONI
     slide = prs.slides.add_slide(prs.slide_layouts[1])
     slide.shapes.title.text = "Azioni suggerite"
-    slide.placeholders[1].text = "\n".join(actions)
+
+    text = ""
+    for level_tag, action in actions:
+        text += f"{level_tag} - {action}\n"
+
+    slide.placeholders[1].text = text
 
     return prs
 
@@ -158,7 +212,11 @@ num_nc = st.number_input("Numero NC", 0, 100, 0)
 nc_data = st.text_area("NC (es: quota,grave | elettrico,media)")
 
 stop = st.number_input("Stop Work", 0, 50, 0)
-crit = st.number_input("Criticità", 0, 100, 0)
+
+# NUOVE CRITICITÀ
+crit_open = st.number_input("Criticità aperte", 0, 100, 0)
+crit_ontime = st.number_input("Criticità risolte in tempo", 0, 100, 0)
+crit_late = st.number_input("Criticità risolte in ritardo", 0, 100, 0)
 
 app = st.number_input("Appaltatori", 0, 50, 0)
 sub = st.number_input("Subappaltatori", 0, 50, 0)
@@ -183,17 +241,30 @@ if st.button("Calcola"):
                 nc_themes.append(parts[0].strip())
                 nc_types.append(parts[1].strip())
 
+    # LETTURA EXCEL MIGLIORATA
     if file is not None:
         df_excel = pd.read_excel(file)
-        if "Stato" in df_excel.columns:
-            crit = len(df_excel[df_excel["Stato"].str.lower() == "aperto"])
+
+        if "Stato" in df_excel.columns and "Scadenza" in df_excel.columns:
+
+            crit_open = len(df_excel[df_excel["Stato"].str.lower() == "aperto"])
+
+            df_closed = df_excel[df_excel["Stato"].str.lower() == "chiuso"]
+
+            if "Data chiusura" in df_excel.columns:
+                df_closed["in_tempo"] = df_closed["Data chiusura"] <= df_closed["Scadenza"]
+
+                crit_ontime = len(df_closed[df_closed["in_tempo"] == True])
+                crit_late = len(df_closed[df_closed["in_tempo"] == False])
 
     data = {
         "inspections": inspections,
         "num_nc": num_nc,
         "nc_types": nc_types,
         "stopworks": stop,
-        "criticalities": crit,
+        "crit_open": crit_open,
+        "crit_ontime": crit_ontime,
+        "crit_late": crit_late,
         "app": app,
         "sub": sub,
         "awareness": awareness,
@@ -202,7 +273,7 @@ if st.button("Calcola"):
 
     risk, level, ncScore, stopScore, critScore, inspectionScore, complexityScore = calculate_risk(data)
 
-    actions = generate_actions(data, level, nc_types, nc_themes, stopScore, critScore)
+    actions = generate_actions(data)
 
     st.metric("Risk Index", round(risk))
     st.metric("Livello", level)
@@ -215,10 +286,10 @@ if st.button("Calcola"):
     st.bar_chart(df.set_index("Componente"))
 
     st.subheader("🎯 Azioni suggerite")
-    for a in actions:
-        st.write(a)
+    for lvl, a in actions:
+        st.write(f"{lvl} - {a}")
 
-    prs = generate_ppt(nome, risk, level, df, actions)
+    prs = generate_ppt(nome, risk, level, df, actions, data)
     buffer = BytesIO()
     prs.save(buffer)
 

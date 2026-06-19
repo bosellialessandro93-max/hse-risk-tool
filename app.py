@@ -7,7 +7,7 @@ from datetime import datetime
 
 
 # =========================
-# CONFIG STREAMLIT
+# CONFIG
 # =========================
 st.set_page_config(
     page_title="HSE Risk Platform",
@@ -17,306 +17,545 @@ st.set_page_config(
 
 
 # =========================
-# FUNZIONI
+# DIZIONARI RISCHIO
 # =========================
-def parse_nc_data(nc_data):
-    nc_types = []
-    nc_themes = []
+NC_SEVERITY_WEIGHTS = {
+    "lieve": 2,
+    "media": 5,
+    "grave": 10,
+    "critica": 18
+}
 
-    if not nc_data.strip():
-        return nc_types, nc_themes
+NC_THEME_WEIGHTS = {
+    "elettrico": 16,
+    "scavi": 16,
+    "quota": 14,
+    "sollevamento": 14,
+    "spazi confinati": 18,
+    "incendio": 14,
+    "viabilità": 10,
+    "dpi": 7,
+    "ordine e pulizia": 6,
+    "documentale": 5,
+    "ambientale": 8,
+    "altro": 6
+}
 
-    rows = nc_data.split("|")
+ACTIVITY_WEIGHTS = {
+    "elettrici": 18,
+    "scavi": 18,
+    "lavori in quota": 16,
+    "sollevamenti": 16,
+    "spazi confinati": 20,
+    "hot work": 15,
+    "movimentazione mezzi": 12,
+    "civili": 8,
+    "meccanici": 10,
+    "altro": 6
+}
 
-    for r in rows:
-        parts = r.split(",")
+AWARENESS_BONUS = {
+    "rischio elettrico": 8,
+    "scavi e sottoservizi": 8,
+    "lavori in quota": 7,
+    "sollevamenti": 7,
+    "spazi confinati": 9,
+    "hot work / incendio": 7,
+    "viabilità e mezzi": 6,
+    "dpi": 4,
+    "ordine e pulizia": 4,
+    "toolbox generale": 3,
+    "altro": 2
+}
 
-        if len(parts) != 2:
-            continue
+LINKS_ACTIVITY_NC = {
+    "elettrici": ["elettrico"],
+    "scavi": ["scavi"],
+    "lavori in quota": ["quota"],
+    "sollevamenti": ["sollevamento"],
+    "spazi confinati": ["spazi confinati"],
+    "hot work": ["incendio"],
+    "movimentazione mezzi": ["viabilità"]
+}
 
-        theme = parts[0].strip().lower()
-        severity = parts[1].strip().lower()
+LINKS_AWARENESS_ACTIVITY = {
+    "rischio elettrico": ["elettrici"],
+    "scavi e sottoservizi": ["scavi"],
+    "lavori in quota": ["lavori in quota"],
+    "sollevamenti": ["sollevamenti"],
+    "spazi confinati": ["spazi confinati"],
+    "hot work / incendio": ["hot work"],
+    "viabilità e mezzi": ["movimentazione mezzi"],
+    "dpi": ["civili", "meccanici", "elettrici", "scavi"],
+    "ordine e pulizia": ["civili", "meccanici"]
+}
 
-        if severity not in ["lieve", "media", "grave", "critica"]:
-            continue
 
-        nc_themes.append(theme)
-        nc_types.append(severity)
+# =========================
+# UTILITY
+# =========================
+def risk_level(risk):
+    if risk <= 20:
+        return "Basso"
+    elif risk <= 40:
+        return "Medio basso"
+    elif risk <= 60:
+        return "Medio"
+    elif risk <= 80:
+        return "Alto"
+    return "Critico"
 
-    return nc_types, nc_themes
+
+def normalize_list(values):
+    return [v.strip().lower() for v in values if v.strip()]
 
 
 def calculate_risk(data):
-    weights = {
-        "lieve": 1,
-        "media": 2,
-        "grave": 4,
-        "critica": 6
-    }
+    details = []
+    explanations = []
 
-    severity = sum(weights.get(x.lower(), 0) for x in data["nc_types"])
-    nc_score = min(data["num_nc"] * 2 + severity, 100)
+    inspections = data["inspections"]
+    num_nc = data["num_nc"]
+    nc_items = data["nc_items"]
+    activities = data["activities"]
+    awareness_types = data["awareness_types"]
+    awareness_count = data["awareness_count"]
 
-    stop_event = data["stopworks"] * 8
-    stop_culture = min(data["stopworks"] * 2, 10)
-    stop_score = max(0, min(stop_event, 100) - stop_culture)
+    # -------------------------
+    # NC SCORE
+    # -------------------------
+    nc_score = 0
 
+    for item in nc_items:
+        theme = item["theme"]
+        severity = item["severity"]
+
+        theme_score = NC_THEME_WEIGHTS.get(theme, 6)
+        severity_score = NC_SEVERITY_WEIGHTS.get(severity, 5)
+        item_score = theme_score + severity_score
+
+        nc_score += item_score
+
+        explanations.append(
+            f"NC su '{theme}' con gravità '{severity}': +{item_score} punti."
+        )
+
+    nc_score = min(nc_score, 100)
+
+    # -------------------------
+    # DENSITÀ NC
+    # -------------------------
+    nc_density = num_nc / max(inspections, 1)
+
+    if nc_density >= 1:
+        density_penalty = 25
+        explanations.append("Densità NC molto alta rispetto alle ispezioni: +25 punti.")
+    elif nc_density >= 0.5:
+        density_penalty = 15
+        explanations.append("Densità NC significativa rispetto alle ispezioni: +15 punti.")
+    elif nc_density >= 0.25:
+        density_penalty = 8
+        explanations.append("Densità NC moderata rispetto alle ispezioni: +8 punti.")
+    else:
+        density_penalty = 0
+
+    # -------------------------
+    # CONTROLLO
+    # -------------------------
+    if inspections == 0 and num_nc > 0:
+        control_score = 30
+        explanations.append("NC presenti senza ispezioni registrate: +30 punti.")
+    elif inspections < 3 and num_nc >= 3:
+        control_score = 25
+        explanations.append("Poche ispezioni rispetto alle NC rilevate: +25 punti.")
+    elif inspections >= 20 and num_nc <= 2:
+        control_score = -10
+        explanations.append("Molte ispezioni con poche NC: -10 punti.")
+    elif inspections >= 10 and num_nc <= 2:
+        control_score = -5
+        explanations.append("Buon presidio ispettivo con poche NC: -5 punti.")
+    else:
+        control_score = 0
+
+    # -------------------------
+    # STOP WORK
+    # -------------------------
+    stop_score = min(data["stopworks"] * 10, 40)
+
+    if data["stopworks"] > 0:
+        explanations.append(
+            f"{data['stopworks']} Stop Work registrati: +{stop_score} punti."
+        )
+
+    # -------------------------
+    # CRITICITÀ
+    # -------------------------
     crit_score = min(
         data["crit_open"] * 12 +
-        data["crit_late"] * 15 +
-        data["crit_ontime"] * 5,
+        data["crit_late"] * 10 +
+        data["crit_ontime"] * 3,
         100
     )
 
-    inspection_score = max(
-        0,
-        60 - data["inspections"] * 3 + data["num_nc"] * 4
+    if data["crit_open"] > 0:
+        explanations.append(
+            f"{data['crit_open']} criticità aperte: incremento rischio."
+        )
+
+    if data["crit_late"] > 0:
+        explanations.append(
+            f"{data['crit_late']} criticità risolte in ritardo: peggiora la capacità di chiusura."
+        )
+
+    # -------------------------
+    # COMPLESSITÀ ORGANIZZATIVA
+    # -------------------------
+    complexity_score = min(
+        data["app"] * 5 +
+        data["sub"] * 8,
+        70
     )
 
-    complexity = data["app"] + data["sub"] * 1.5
-    complexity_score = min(complexity * 5, 100)
+    if data["sub"] >= 5:
+        complexity_score += 15
+        explanations.append("Numero elevato di subappaltatori: +15 punti.")
 
-    activity_score = min((data["activities"] ** 1.5) * 4, 100)
+    complexity_score = min(complexity_score, 100)
 
-    nc_density = data["num_nc"] / (data["inspections"] + 1)
+    # -------------------------
+    # ATTIVITÀ
+    # -------------------------
+    activity_score = 0
 
-    penalty_density = 30 if nc_density > 1 else 15 if nc_density > 0.5 else 0
-    penalty_control = 30 if data["inspections"] < 3 and data["num_nc"] >= 3 else 0
-    interference_penalty = 15 if data["activities"] >= 3 else 0
+    for act in activities:
+        score = ACTIVITY_WEIGHTS.get(act, 6)
+        activity_score += score
+        explanations.append(f"Attività '{act}': +{score} punti.")
 
-    electrical_risk = 0
-    excavation_risk = 0
+    if len(activities) >= 3:
+        activity_score += 20
+        explanations.append("Tre o più attività contemporanee: +20 punti per interferenza.")
 
-    if data["activity_type"] == "elettrici":
-        electrical_risk += 10
+    if len(activities) >= 5:
+        activity_score += 15
+        explanations.append("Cinque o più attività contemporanee: +15 punti aggiuntivi.")
 
-        if data["awareness"] < 3:
-            electrical_risk += 10
+    activity_score = min(activity_score, 100)
 
-        if "elettrico" in data["nc_themes"]:
-            electrical_risk += 15
+    # -------------------------
+    # CORRELAZIONE ATTIVITÀ / NC
+    # -------------------------
+    correlation_penalty = 0
 
-    if data["activity_type"] == "scavi":
-        excavation_risk += 10
+    nc_themes = [item["theme"] for item in nc_items]
 
-        if "scavi" in data["nc_themes"]:
-            excavation_risk += 20
+    for act in activities:
+        expected_nc = LINKS_ACTIVITY_NC.get(act, [])
 
-        if data["activities"] >= 3:
-            excavation_risk += 10
+        for theme in expected_nc:
+            if theme in nc_themes:
+                correlation_penalty += 15
+                explanations.append(
+                    f"Correlazione critica: attività '{act}' con NC su '{theme}': +15 punti."
+                )
 
-    fase_penalty = 0
+    correlation_penalty = min(correlation_penalty, 45)
+
+    # -------------------------
+    # FASE
+    # -------------------------
+    fase_score = 0
 
     if data["fase"] == "commissioning":
-        fase_penalty += 15
+        fase_score += 18
+        explanations.append("Fase commissioning: +18 punti per presenza energie/prove/interferenze.")
+    elif data["fase"] == "punch list":
+        fase_score += 10
+        explanations.append("Fase punch list: +10 punti per attività residue e discontinuità operative.")
+    elif data["fase"] == "cantierizzazione":
+        fase_score += 8
+        explanations.append("Fase cantierizzazione: +8 punti per allestimenti e avvio attività.")
 
-        if data["activity_type"] == "elettrici" and data["awareness"] < 5:
-            fase_penalty += 15
+    # -------------------------
+    # BONUS SENSIBILIZZAZIONI
+    # Non correlate alle ispezioni.
+    # Bonus basato su quantità, qualità e coerenza con attività/NC.
+    # -------------------------
+    awareness_bonus = 0
 
-    complexity_penalty = 10 if data["sub"] > 5 else 0
+    for aw in awareness_types:
+        bonus = AWARENESS_BONUS.get(aw, 2)
+        awareness_bonus += bonus
+        explanations.append(f"Sensibilizzazione '{aw}': -{bonus} punti.")
 
-    awareness_ratio = data["awareness"] / (
-        data["activities"] + data["inspections"] + 1
-    )
+    if awareness_count >= 5:
+        awareness_bonus += 5
+        explanations.append("Numero adeguato di sensibilizzazioni: -5 punti.")
 
-    awareness_bonus = 20 if awareness_ratio > 1 else 10 if awareness_ratio > 0.5 else 0
+    if awareness_count >= 10:
+        awareness_bonus += 5
+        explanations.append("Buona continuità nelle sensibilizzazioni: -5 punti.")
 
+    # Bonus coerenza attività/sensibilizzazione
+    for aw in awareness_types:
+        covered_activities = LINKS_AWARENESS_ACTIVITY.get(aw, [])
+
+        for act in activities:
+            if act in covered_activities:
+                awareness_bonus += 5
+                explanations.append(
+                    f"Sensibilizzazione coerente con attività '{act}': -5 punti."
+                )
+
+    # Bonus coerenza NC/sensibilizzazione
+    for aw in awareness_types:
+        if aw == "rischio elettrico" and "elettrico" in nc_themes:
+            awareness_bonus += 4
+            explanations.append("Sensibilizzazione mirata su NC elettriche: -4 punti.")
+
+        if aw == "scavi e sottoservizi" and "scavi" in nc_themes:
+            awareness_bonus += 4
+            explanations.append("Sensibilizzazione mirata su NC scavi: -4 punti.")
+
+        if aw == "lavori in quota" and "quota" in nc_themes:
+            awareness_bonus += 4
+            explanations.append("Sensibilizzazione mirata su NC lavori in quota: -4 punti.")
+
+        if aw == "spazi confinati" and "spazi confinati" in nc_themes:
+            awareness_bonus += 5
+            explanations.append("Sensibilizzazione mirata su spazi confinati: -5 punti.")
+
+    awareness_bonus = min(awareness_bonus, 35)
+
+    # -------------------------
+    # CALCOLO FINALE
+    # -------------------------
     risk = (
-        nc_score * 0.15 +
-        stop_score * 0.10 +
+        nc_score * 0.20 +
         crit_score * 0.15 +
-        inspection_score * 0.15 +
+        activity_score * 0.20 +
         complexity_score * 0.10 +
-        activity_score * 0.10 +
-        penalty_density +
-        penalty_control +
-        interference_penalty +
-        electrical_risk +
-        excavation_risk +
-        fase_penalty +
-        complexity_penalty -
+        stop_score * 0.10 +
+        density_penalty +
+        control_score +
+        correlation_penalty +
+        fase_score -
         awareness_bonus
     )
 
     risk = max(0, min(100, risk))
+    level = risk_level(risk)
 
-    if risk <= 20:
-        level = "Basso"
-    elif risk <= 40:
-        level = "Medio basso"
-    elif risk <= 60:
-        level = "Medio"
-    elif risk <= 80:
-        level = "Alto"
-    else:
-        level = "Critico"
+    details.append(("NC", nc_score))
+    details.append(("Criticità", crit_score))
+    details.append(("Attività", activity_score))
+    details.append(("Complessità", complexity_score))
+    details.append(("Stop Work", stop_score))
+    details.append(("Densità NC", density_penalty))
+    details.append(("Controllo", control_score))
+    details.append(("Correlazioni critiche", correlation_penalty))
+    details.append(("Fase", fase_score))
+    details.append(("Bonus sensibilizzazioni", -awareness_bonus))
 
-    details = {
-        "NC": nc_score,
-        "Stop Work": stop_score,
-        "Criticità": crit_score,
-        "Ispezioni": inspection_score,
-        "Complessità": complexity_score,
-        "Attività": activity_score,
-        "Penalità densità NC": penalty_density,
-        "Penalità controllo": penalty_control,
-        "Penalità interferenze": interference_penalty,
-        "Rischio elettrico": electrical_risk,
-        "Rischio scavi": excavation_risk,
-        "Penalità fase": fase_penalty,
-        "Penalità complessità": complexity_penalty,
-        "Bonus awareness": -awareness_bonus
-    }
-
-    return risk, level, details
+    return risk, level, details, explanations
 
 
-def generate_actions(data):
+def generate_actions(data, risk, level):
     actions = []
 
-    nc = data["num_nc"]
-    inspections = data["inspections"]
-    awareness = data["awareness"]
-    activities = data["activities"]
-    activity_type = data["activity_type"]
+    nc_themes = [item["theme"] for item in data["nc_items"]]
+    severe_nc = [
+        item for item in data["nc_items"]
+        if item["severity"] in ["grave", "critica"]
+    ]
 
-    nc_density = nc / (inspections + 1)
-
-    if nc > inspections:
+    if risk >= 80:
         actions.append((
             "MUST HAVE",
-            f"🔴 Sono state rilevate {nc} NC a fronte di sole {inspections} ispezioni. "
-            "Il sistema appare più reattivo che preventivo."
+            "🔴 Rischio critico: convocare coordinamento operativo immediato e validare piano azioni prima della prosecuzione."
         ))
 
-    if nc_density > 1:
+    if severe_nc:
         actions.append((
             "MUST HAVE",
-            f"🔴 La densità NC è molto elevata: {round(nc_density, 2)}. "
-            "Serve aumentare il presidio operativo."
+            f"🔴 Presenti {len(severe_nc)} NC gravi/critiche. Definire responsabile, scadenza e verifica chiusura."
         ))
 
-    if inspections < 3 and nc >= 3:
+    for act in data["activities"]:
+        if act == "elettrici":
+            actions.append((
+                "MUST HAVE",
+                "⚡ Attività elettriche: verificare sezionamenti, autorizzazioni, messa in sicurezza, DPI e competenze PES/PAV/PEI."
+            ))
+
+        if act == "scavi":
+            actions.append((
+                "MUST HAVE",
+                "🚧 Scavi: verificare sottoservizi, stabilità fronti, accessi, delimitazioni e presenza di acqua/materiale instabile."
+            ))
+
+        if act == "lavori in quota":
+            actions.append((
+                "MUST HAVE",
+                "🪜 Lavori in quota: verificare parapetti, ancoraggi, PLE, imbracature, accessi e piano di emergenza."
+            ))
+
+        if act == "sollevamenti":
+            actions.append((
+                "MUST HAVE",
+                "🏗️ Sollevamenti: verificare piano di sollevamento, portate, accessori, interferenze e area segregata."
+            ))
+
+        if act == "spazi confinati":
+            actions.append((
+                "MUST HAVE",
+                "☠️ Spazi confinati: autorizzazione, monitoraggio atmosfera, recupero emergenza, presidio esterno e permesso di lavoro."
+            ))
+
+        if act == "hot work":
+            actions.append((
+                "MUST HAVE",
+                "🔥 Hot work: verificare permesso, estintori, rimozione combustibili, fire watch e controllo post-attività."
+            ))
+
+    if len(data["activities"]) >= 3:
         actions.append((
             "MUST HAVE",
-            "🔴 Poche ispezioni rispetto alle NC rilevate. Pianificare controlli HSE più frequenti."
+            "🔴 Interferenze elevate: predisporre matrice interferenziale giornaliera e briefing pre-job tra imprese."
         ))
 
-    if inspections > 20 and nc < 3:
+    if "elettrico" in nc_themes:
+        actions.append((
+            "MUST HAVE",
+            "🔴 NC elettriche: bloccare attività non conformi fino a ripristino condizioni sicure."
+        ))
+
+    if "scavi" in nc_themes:
+        actions.append((
+            "MUST HAVE",
+            "🔴 NC su scavi: rivalutare rischio sezione di scavo e sottoservizi prima della prosecuzione."
+        ))
+
+    if "quota" in nc_themes:
+        actions.append((
+            "MUST HAVE",
+            "🔴 NC lavori in quota: verifica immediata protezioni collettive e sistemi anticaduta."
+        ))
+
+    if data["awareness_count"] == 0:
+        actions.append((
+            "MUST HAVE",
+            "🟡 Nessuna sensibilizzazione registrata: pianificare toolbox mirati prima delle attività critiche."
+        ))
+
+    missing_awareness = []
+
+    if "elettrici" in data["activities"] and "rischio elettrico" not in data["awareness_types"]:
+        missing_awareness.append("rischio elettrico")
+
+    if "scavi" in data["activities"] and "scavi e sottoservizi" not in data["awareness_types"]:
+        missing_awareness.append("scavi e sottoservizi")
+
+    if "lavori in quota" in data["activities"] and "lavori in quota" not in data["awareness_types"]:
+        missing_awareness.append("lavori in quota")
+
+    if "sollevamenti" in data["activities"] and "sollevamenti" not in data["awareness_types"]:
+        missing_awareness.append("sollevamenti")
+
+    if missing_awareness:
+        actions.append((
+            "MUST HAVE",
+            "🟠 Mancano sensibilizzazioni mirate su: " + ", ".join(missing_awareness) + "."
+        ))
+
+    if data["crit_open"] > 0:
+        actions.append((
+            "MUST HAVE",
+            f"🟠 Criticità aperte: {data['crit_open']}. Definire priorità, owner e data di chiusura."
+        ))
+
+    if data["crit_late"] > 0:
+        actions.append((
+            "MUST HAVE",
+            f"🟠 Criticità chiuse in ritardo: {data['crit_late']}. Analizzare cause del ritardo e capacità di follow-up."
+        ))
+
+    if level in ["Basso", "Medio basso"]:
         actions.append((
             "NICE TO HAVE",
-            f"🟢 Le {inspections} ispezioni hanno generato solo {nc} NC. "
-            "Il sistema di controllo sembra efficace."
+            "🟢 Mantenere trend positivo con ispezioni mirate, tracciamento NC e toolbox brevi sulle attività del giorno."
         ))
 
-    if awareness < inspections:
-        actions.append((
-            "MUST HAVE",
-            f"🟡 Le sensibilizzazioni ({awareness}) sono inferiori alle ispezioni ({inspections}). "
-            "Rafforzare cultura sicurezza e comunicazione operativa."
-        ))
-
-    if awareness > 30:
-        actions.append((
-            "NICE TO HAVE",
-            f"🟢 Elevato numero di sensibilizzazioni: {awareness}. "
-            "Elemento positivo per la riduzione del rischio comportamentale."
-        ))
-
-    if activities >= 3:
-        actions.append((
-            "MUST HAVE",
-            f"🔴 Sono presenti {activities} attività contemporanee. "
-            "Gestire interferenze, viabilità, aree segregate e coordinamento."
-        ))
-
-    if activity_type == "elettrici":
-        actions.append((
-            "MUST HAVE",
-            "⚡ Attività elettriche presenti. Verificare procedure, autorizzazioni, sezionamenti e DPI."
-        ))
-
-    if activity_type == "scavi":
-        actions.append((
-            "MUST HAVE",
-            "🚧 Attività di scavo presenti. Verificare sottoservizi, fronti di scavo, accessi e stabilità."
-        ))
-
-    if "elettrico" in data["nc_themes"]:
-        actions.append((
-            "MUST HAVE",
-            "🔴 Rilevate NC su rischio elettrico. Necessario intervento immediato."
-        ))
-
-    if "scavi" in data["nc_themes"]:
-        actions.append((
-            "MUST HAVE",
-            "🔴 Rilevate NC su scavi. Verificare condizioni operative prima della prosecuzione."
-        ))
-
-    if data["fase"] == "commissioning":
-        actions.append((
-            "MUST HAVE",
-            "🟠 Fase di commissioning: aumentare controllo su prove, energie, autorizzazioni e interferenze."
-        ))
-
-    if len(actions) < 3:
+    if len(actions) < 4:
         actions.append((
             "IDEA",
-            "Mantenere controllo periodico, tracciamento NC e miglioramento continuo."
+            "Mantenere presidio operativo e aggiornare la valutazione rischio in caso di nuove attività o nuove imprese."
         ))
 
     return actions
 
 
-def generate_ppt(nome, risk, level, df, actions, data):
+def generate_ppt(nome, risk, level, driver_df, actions_df, explanations, data):
     prs = Presentation()
 
     slide = prs.slides.add_slide(prs.slide_layouts[0])
     slide.shapes.title.text = "HSE Risk Report"
-    slide.placeholders[1].text = f"Cantiere: {nome}\nData: {datetime.now().strftime('%d/%m/%Y')}"
+    slide.placeholders[1].text = (
+        f"Cantiere: {nome}\n"
+        f"Data: {datetime.now().strftime('%d/%m/%Y')}"
+    )
 
     slide = prs.slides.add_slide(prs.slide_layouts[1])
-    slide.shapes.title.text = "Risultato valutazione"
+    slide.shapes.title.text = "Sintesi rischio"
     slide.placeholders[1].text = (
         f"Risk Index: {round(risk)} / 100\n"
-        f"Livello rischio: {level}\n\n"
+        f"Livello: {level}\n\n"
         f"Fase: {data['fase']}\n"
-        f"Tipologia attività: {data['activity_type']}"
+        f"Attività: {', '.join(data['activities']) if data['activities'] else 'Nessuna'}\n"
+        f"Sensibilizzazioni: {', '.join(data['awareness_types']) if data['awareness_types'] else 'Nessuna'}"
     )
 
     slide = prs.slides.add_slide(prs.slide_layouts[5])
     slide.shapes.title.text = "Driver rischio"
 
     table = slide.shapes.add_table(
-        len(df) + 1,
+        len(driver_df) + 1,
         2,
-        Inches(1),
+        Inches(0.8),
         Inches(1.4),
-        Inches(7.5),
-        Inches(4)
+        Inches(8),
+        Inches(4.5)
     ).table
 
-    table.cell(0, 0).text = "Componente"
+    table.cell(0, 0).text = "Driver"
     table.cell(0, 1).text = "Valore"
 
-    for i, row in df.iterrows():
-        table.cell(i + 1, 0).text = str(row["Componente"])
+    for i, row in driver_df.iterrows():
+        table.cell(i + 1, 0).text = str(row["Driver"])
         table.cell(i + 1, 1).text = str(round(row["Valore"], 1))
 
     slide = prs.slides.add_slide(prs.slide_layouts[1])
-    slide.shapes.title.text = "Azioni suggerite"
+    slide.shapes.title.text = "Azioni prioritarie"
 
     text = ""
-    for lvl, action in actions:
-        text += f"{lvl} - {action}\n\n"
+    for _, row in actions_df.head(8).iterrows():
+        text += f"{row['Priorità']} - {row['Azione']}\n\n"
+
+    slide.placeholders[1].text = text
+
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+    slide.shapes.title.text = "Motivazione calcolo"
+
+    text = ""
+    for e in explanations[:10]:
+        text += f"• {e}\n"
 
     slide.placeholders[1].text = text
 
     return prs
 
 
-def generate_excel(nome, risk, level, df, actions, data):
+def generate_excel(nome, risk, level, driver_df, actions_df, explanations_df, data):
     buffer = BytesIO()
 
     summary = pd.DataFrame([{
@@ -325,7 +564,6 @@ def generate_excel(nome, risk, level, df, actions, data):
         "Risk Index": round(risk, 1),
         "Livello": level,
         "Fase": data["fase"],
-        "Tipologia attività": data["activity_type"],
         "Ispezioni": data["inspections"],
         "NC": data["num_nc"],
         "Stop Work": data["stopworks"],
@@ -334,16 +572,19 @@ def generate_excel(nome, risk, level, df, actions, data):
         "Criticità in ritardo": data["crit_late"],
         "Appaltatori": data["app"],
         "Subappaltatori": data["sub"],
-        "Sensibilizzazioni": data["awareness"],
-        "Attività contemporanee": data["activities"]
+        "Sensibilizzazioni numero": data["awareness_count"],
+        "Tipologie attività": ", ".join(data["activities"]),
+        "Tipologie sensibilizzazioni": ", ".join(data["awareness_types"])
     }])
 
-    actions_df = pd.DataFrame(actions, columns=["Priorità", "Azione"])
+    nc_df = pd.DataFrame(data["nc_items"])
 
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         summary.to_excel(writer, sheet_name="Sintesi", index=False)
-        df.to_excel(writer, sheet_name="Driver rischio", index=False)
+        driver_df.to_excel(writer, sheet_name="Driver rischio", index=False)
         actions_df.to_excel(writer, sheet_name="Azioni", index=False)
+        explanations_df.to_excel(writer, sheet_name="Motivazione", index=False)
+        nc_df.to_excel(writer, sheet_name="NC dettaglio", index=False)
 
     buffer.seek(0)
     return buffer
@@ -352,11 +593,11 @@ def generate_excel(nome, risk, level, df, actions, data):
 # =========================
 # UI
 # =========================
-st.title("🦺 HSE Risk Platform")
-st.caption("Valutazione rischio HSE per cantieri, attività critiche e interferenze operative.")
+st.title("🦺 HSE Risk Platform PRO")
+st.caption("Valutazione rischio HSE con correlazione tra attività, NC, sensibilizzazioni e output operativo.")
 
 with st.sidebar:
-    st.header("📋 Input valutazione")
+    st.header("📋 Dati cantiere")
 
     nome = st.text_input("Nome cantiere", value="Cantiere Demo")
 
@@ -367,125 +608,225 @@ with st.sidebar:
 
     st.divider()
 
-    inspections = st.number_input("Ispezioni", 0, 1000, 10)
-    num_nc = st.number_input("Numero NC", 0, 100, 0)
+    st.header("🔍 Controlli e NC")
 
-    nc_data = st.text_area(
-        "NC",
-        placeholder="Esempio: elettrico,grave | scavi,media | viabilità,lieve"
+    inspections = st.number_input("Numero ispezioni", 0, 1000, 10)
+    num_nc = st.number_input("Numero totale NC", 0, 300, 0)
+
+    st.write("Dettaglio NC")
+
+    nc_items = []
+
+    nc_count_detail = st.number_input(
+        "Quante NC vuoi dettagliare?",
+        0,
+        20,
+        min(num_nc, 3)
     )
 
-    stop = st.number_input("Stop Work", 0, 50, 0)
+    for i in range(nc_count_detail):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            theme = st.selectbox(
+                f"Tema NC {i + 1}",
+                list(NC_THEME_WEIGHTS.keys()),
+                key=f"nc_theme_{i}"
+            )
+
+        with col2:
+            severity = st.selectbox(
+                f"Gravità NC {i + 1}",
+                list(NC_SEVERITY_WEIGHTS.keys()),
+                key=f"nc_severity_{i}"
+            )
+
+        nc_items.append({
+            "theme": theme,
+            "severity": severity
+        })
 
     st.divider()
 
-    crit_open = st.number_input("Criticità aperte", 0, 100, 0)
-    crit_ontime = st.number_input("Criticità risolte in tempo", 0, 100, 0)
-    crit_late = st.number_input("Criticità risolte in ritardo", 0, 100, 0)
+    st.header("⛔ Stop Work e criticità")
+
+    stopworks = st.number_input("Stop Work", 0, 100, 0)
+    crit_open = st.number_input("Criticità aperte", 0, 200, 0)
+    crit_ontime = st.number_input("Criticità risolte in tempo", 0, 200, 0)
+    crit_late = st.number_input("Criticità risolte in ritardo", 0, 200, 0)
 
     st.divider()
 
-    app = st.number_input("Appaltatori", 0, 50, 0)
-    sub = st.number_input("Subappaltatori", 0, 50, 0)
+    st.header("🏗️ Organizzazione")
 
-    awareness = st.number_input("Sensibilizzazioni", 0, 1000, 0)
+    app = st.number_input("Appaltatori", 0, 100, 1)
+    sub = st.number_input("Subappaltatori", 0, 100, 0)
 
-    activity_type = st.selectbox(
-        "Tipologia attività",
-        ["scavi", "elettrici", "altro"]
+    st.divider()
+
+    st.header("⚙️ Attività in corso")
+
+    activities = st.multiselect(
+        "Tipologie attività presenti",
+        list(ACTIVITY_WEIGHTS.keys()),
+        default=["civili"]
     )
 
-    activities = st.number_input("Numero attività contemporanee", 0, 20, 0)
+    st.divider()
+
+    st.header("🧠 Sensibilizzazioni")
+
+    awareness_count = st.number_input(
+        "Numero sensibilizzazioni effettuate",
+        0,
+        1000,
+        0
+    )
+
+    awareness_types = st.multiselect(
+        "Tipologie sensibilizzazioni effettuate",
+        list(AWARENESS_BONUS.keys())
+    )
+
+    st.divider()
 
     calcola = st.button("Calcola rischio", type="primary")
 
 
 # =========================
-# CALCOLO
+# MAIN
 # =========================
-if calcola:
-    nc_themes, nc_types = parse_nc_data(nc_data)
+if not calcola:
+    st.info("Compila i dati nella sidebar e clicca su **Calcola rischio**.")
+    st.stop()
 
-    data = {
-        "inspections": inspections,
-        "num_nc": num_nc,
-        "nc_types": nc_types,
-        "nc_themes": nc_themes,
-        "stopworks": stop,
-        "crit_open": crit_open,
-        "crit_ontime": crit_ontime,
-        "crit_late": crit_late,
-        "app": app,
-        "sub": sub,
-        "awareness": awareness,
-        "fase": fase,
-        "activity_type": activity_type,
-        "activities": activities
-    }
 
-    risk, level, details = calculate_risk(data)
-    actions = generate_actions(data)
+data = {
+    "nome": nome,
+    "fase": fase,
+    "inspections": inspections,
+    "num_nc": num_nc,
+    "nc_items": nc_items,
+    "stopworks": stopworks,
+    "crit_open": crit_open,
+    "crit_ontime": crit_ontime,
+    "crit_late": crit_late,
+    "app": app,
+    "sub": sub,
+    "activities": normalize_list(activities),
+    "awareness_count": awareness_count,
+    "awareness_types": normalize_list(awareness_types)
+}
 
-    df = pd.DataFrame({
-        "Componente": list(details.keys()),
-        "Valore": list(details.values())
-    })
+risk, level, details, explanations = calculate_risk(data)
+actions = generate_actions(data, risk, level)
 
-    col1, col2, col3, col4 = st.columns(4)
+driver_df = pd.DataFrame(details, columns=["Driver", "Valore"])
+actions_df = pd.DataFrame(actions, columns=["Priorità", "Azione"])
+explanations_df = pd.DataFrame(explanations, columns=["Motivazione"])
 
-    col1.metric("Risk Index", f"{round(risk)} / 100")
-    col2.metric("Livello", level)
-    col3.metric("NC", num_nc)
-    col4.metric("Ispezioni", inspections)
+# =========================
+# DASHBOARD
+# =========================
+col1, col2, col3, col4 = st.columns(4)
 
-    st.divider()
+col1.metric("Risk Index", f"{round(risk)} / 100")
+col2.metric("Livello", level)
+col3.metric("NC", num_nc)
+col4.metric("Attività", len(activities))
 
-    left, right = st.columns([1.2, 1])
+st.divider()
 
-    with left:
-        st.subheader("📊 Driver rischio")
-        st.bar_chart(df.set_index("Componente"))
+left, right = st.columns([1.2, 1])
 
-    with right:
-        st.subheader("📌 Sintesi valutazione")
+with left:
+    st.subheader("📊 Driver rischio")
+    st.bar_chart(driver_df.set_index("Driver"))
 
-        st.write(f"""
-        Il cantiere **{nome}** ha un Risk Index pari a **{round(risk)} / 100**.
+with right:
+    st.subheader("📌 Lettura del risultato")
 
-        Il livello di rischio è classificato come **{level}**.
+    st.write(f"""
+    Il cantiere **{nome}** ha un indice rischio pari a **{round(risk)} / 100**.
 
-        I principali elementi considerati sono:
-        - NC rilevate: **{num_nc}**
-        - Ispezioni effettuate: **{inspections}**
-        - Stop Work: **{stop}**
-        - Attività contemporanee: **{activities}**
-        - Fase: **{fase}**
-        - Tipologia attività: **{activity_type}**
-        """)
+    Il livello è **{level}**.
 
-        if nc_data and len(nc_types) == 0:
-            st.warning(
-                "Attenzione: le NC inserite non rispettano il formato richiesto. "
-                "Usa ad esempio: elettrico,grave | scavi,media"
-            )
+    Il calcolo considera:
+    - gravità e tema delle NC;
+    - attività effettivamente in corso;
+    - coerenza tra attività e NC;
+    - criticità aperte o chiuse in ritardo;
+    - complessità organizzativa;
+    - fase del cantiere;
+    - bonus autonomo per sensibilizzazioni mirate.
+    """)
 
-    st.divider()
+    if awareness_count > 0 and not awareness_types:
+        st.warning(
+            "Hai inserito un numero di sensibilizzazioni ma nessuna tipologia. "
+            "Per valorizzarle meglio, seleziona almeno una tipologia."
+        )
 
-    st.subheader("🎯 Azioni suggerite")
+    if num_nc > len(nc_items):
+        st.warning(
+            f"Hai indicato {num_nc} NC totali ma ne hai dettagliate solo {len(nc_items)}. "
+            "Il rischio sarà più preciso se dettagli più NC."
+        )
 
-    actions_df = pd.DataFrame(actions, columns=["Priorità", "Azione"])
+st.divider()
+
+# =========================
+# DETTAGLIO
+# =========================
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🎯 Azioni",
+    "🧠 Motivazione",
+    "📋 NC",
+    "📤 Export"
+])
+
+with tab1:
+    st.subheader("Azioni suggerite")
     st.dataframe(actions_df, use_container_width=True)
 
-    st.divider()
+with tab2:
+    st.subheader("Perché il sistema ha calcolato questo rischio")
+    st.dataframe(explanations_df, use_container_width=True)
 
-    st.subheader("📤 Export report")
+with tab3:
+    st.subheader("Dettaglio NC inserite")
 
-    ppt = generate_ppt(nome, risk, level, df, actions, data)
+    if nc_items:
+        st.dataframe(pd.DataFrame(nc_items), use_container_width=True)
+    else:
+        st.info("Nessuna NC dettagliata.")
+
+with tab4:
+    st.subheader("Download report")
+
+    ppt = generate_ppt(
+        nome,
+        risk,
+        level,
+        driver_df,
+        actions_df,
+        explanations,
+        data
+    )
+
     ppt_buffer = BytesIO()
     ppt.save(ppt_buffer)
     ppt_buffer.seek(0)
 
-    excel_buffer = generate_excel(nome, risk, level, df, actions, data)
+    excel_buffer = generate_excel(
+        nome,
+        risk,
+        level,
+        driver_df,
+        actions_df,
+        explanations_df,
+        data
+    )
 
     safe_nome = nome.replace(" ", "_").replace("/", "_")
 
@@ -493,7 +834,7 @@ if calcola:
 
     with col_a:
         st.download_button(
-            label="📥 Scarica report PowerPoint",
+            label="📥 Scarica PowerPoint",
             data=ppt_buffer,
             file_name=f"HSE_Risk_Report_{safe_nome}.pptx",
             mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
@@ -501,11 +842,8 @@ if calcola:
 
     with col_b:
         st.download_button(
-            label="📥 Scarica report Excel",
+            label="📥 Scarica Excel",
             data=excel_buffer,
             file_name=f"HSE_Risk_Report_{safe_nome}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
-else:
-    st.info("Compila i dati nella sidebar e clicca su **Calcola rischio**.")

@@ -4,8 +4,9 @@ from pptx import Presentation
 from pptx.util import Inches
 from io import BytesIO
 
+
 # ==========================================
-# CALCOLO RISCHIO (MIGLIORATO)
+# CALCOLO RISCHIO
 # ==========================================
 def calculate_risk(data):
 
@@ -30,8 +31,12 @@ def calculate_risk(data):
     complexity = data["app"] + data["sub"] * 1.5
     complexityScore = min(complexity * 5, 100)
 
-    # NUOVO: attività e interferenze
-    activityScore = min(data["activities"] * 5 + (5 if data["activity_type"] == "elettrici" else 3), 100)
+    # ATTIVITÀ (NUOVO)
+    activityScore = min(
+        data["activities"] * 5 +
+        (5 if data["activity_type"] == "elettrici" else 3),
+        100
+    )
 
     awareness_bonus = min(data["awareness"] * 0.1, 15)
 
@@ -56,7 +61,6 @@ def calculate_risk(data):
 
     risk = max(0, min(100, risk))
 
-    # Livello
     if risk <= 20:
         level = "Basso"
     elif risk <= 40:
@@ -72,14 +76,13 @@ def calculate_risk(data):
 
 
 # ==========================================
-# AZIONI INTELLIGENTI (SUPER ARGOMENTATE)
+# AZIONI INTELLIGENTI
 # ==========================================
 def generate_actions(data):
 
     actions = []
 
     nc = data["num_nc"]
-    stop = data["stopworks"]
     inspections = data["inspections"]
     awareness = data["awareness"]
     activities = data["activities"]
@@ -92,86 +95,56 @@ def generate_actions(data):
     total_crit = crit_open + crit_late + crit_ontime
     late_ratio = (crit_late / total_crit) if total_crit > 0 else 0
 
-    # ======================================
-    # CORRELAZIONE ISPEZIONI / NC
-    # ======================================
+    # ✅ ISPEZIONI vs NC
     if inspections > 20 and nc < 3:
         actions.append(("NICE TO HAVE",
-            f"🟢 Il numero elevato di ispezioni ({inspections}) rispetto alle NC ({nc}) "
-            "indica un sistema di controllo efficace che sta prevenendo eventi."))
+            f"🟢 Elevato numero di ispezioni ({inspections}) e poche NC ({nc}) → sistema efficace."))
 
     if inspections < 5 and nc > 3:
         actions.append(("MUST HAVE",
-            f"🔴 Sono state registrate {nc} NC a fronte di sole {inspections} ispezioni. "
-            "Il basso livello di controllo aumenta il rischio di eventi non intercettati."))
+            f"🔴 Poche ispezioni ({inspections}) e molte NC ({nc}) → rischio elevato e bassa prevenzione."))
 
     if nc > inspections:
         actions.append(("MUST HAVE",
-            f"🔴 Il numero di NC ({nc}) supera quello delle ispezioni ({inspections}). "
-            "Questo indica un sistema reattivo e non preventivo."))
+            f"🔴 NC ({nc}) superiori alle ispezioni ({inspections}) → sistema reattivo."))
 
-    # ======================================
-    # AWARENESS
-    # ======================================
+    # ✅ AWARENESS
     if awareness > 30:
         actions.append(("NICE TO HAVE",
-            f"🟢 Sono state effettuate {awareness} sensibilizzazioni: "
-            "questo contribuisce alla riduzione del rischio migliorando i comportamenti."))
+            f"🟢 Buon livello di sensibilizzazione ({awareness}) → riduzione del rischio."))
 
     if awareness < inspections:
         actions.append(("MUST HAVE",
-            f"🟡 Le sensibilizzazioni ({awareness}) sono inferiori alle ispezioni ({inspections}). "
-            "È necessario rafforzare la cultura della sicurezza."))
+            f"🟡 Sensibilizzazioni ({awareness}) inferiori alle ispezioni ({inspections}) → aumentare."))
 
-    # ======================================
-    # CRITICITÀ
-    # ======================================
+    # ✅ CRITICITÀ
     if late_ratio > 0.3:
         actions.append(("MUST HAVE",
-            f"🔴 Il {round(late_ratio*100)}% delle criticità viene chiuso in ritardo. "
-            "Questo aumenta la permanenza dell’esposizione al rischio."))
+            f"🔴 {round(late_ratio*100)}% criticità chiuse in ritardo → esposizione prolungata."))
 
     if crit_open > 10:
         actions.append(("MUST HAVE",
-            f"🔴 Sono presenti {crit_open} criticità aperte. "
-            "È necessaria una riduzione immediata dello stock aperto."))
+            f"🔴 {crit_open} criticità aperte → necessario piano chiusura."))
 
     if crit_ontime > crit_late:
         actions.append(("NICE TO HAVE",
-            "🟢 Buona capacità di gestione delle criticità, la maggior parte viene chiusa nei tempi."))
+            "🟢 Buona gestione delle criticità (chiuse nei tempi)."))
 
-    # ======================================
-    # ATTIVITÀ E INTERFERENZE
-    # ======================================
+    # ✅ ATTIVITÀ
     if activities >= 3:
         actions.append(("MUST HAVE",
-            f"🔴 Sono presenti {activities} attività in contemporanea ({activity_type}). "
-            "Questo aumenta il rischio interferenziale."))
+            f"🔴 {activities} attività simultanee → alto rischio interferenze."))
 
         if activity_type == "elettrici":
             actions.append(("MUST HAVE",
-                "⚡ Attività elettriche in corso: si raccomanda sensibilizzazione su rischio elettrico "
-                "e verifica PES/PAV e procedure LOTO."))
+                "⚡ Sensibilizzazione rischio elettrico consigliata (LOTO, PES/PAV)."))
 
         if activity_type == "scavi":
             actions.append(("MUST HAVE",
-                "🚧 Attività di scavo in corso: rafforzare sensibilizzazione su seppellimento, "
-                "sottoservizi e stabilità fronti."))
+                "🚧 Sensibilizzazione scavi: seppellimento e sottoservizi."))
 
-    # ======================================
-    # STOP WORK
-    # ======================================
-    if stop > 3:
-        actions.append(("MUST HAVE",
-            f"🔴 Elevato numero di Stop Work ({stop}). "
-            "Indica criticità operative ricorrenti."))
-
-    # ======================================
-    # GARANTIRE MINIMO OUTPUT
-    # ======================================
     if len(actions) < 3:
-        actions.append(("IDEA",
-            "👉 Mantenere monitoraggio continuo e rafforzare approccio preventivo."))
+        actions.append(("IDEA", "👉 Mantenere controllo e miglioramento continuo."))
 
     return actions
 
@@ -191,15 +164,10 @@ def generate_ppt(nome, risk, level, df, actions, data):
     slide.shapes.title.text = "Risultato"
     slide.placeholders[1].text = f"Risk Index: {round(risk)} - {level}"
 
-    # NUOVO: attività
     slide = prs.slides.add_slide(prs.slide_layouts[1])
-    slide.shapes.title.text = "Attività in corso"
-    slide.placeholders[1].text = (
-        f"Tipologia: {data['activity_type']}\n"
-        f"Numero attività: {data['activities']}"
-    )
+    slide.shapes.title.text = "Attività"
+    slide.placeholders[1].text = f"{data['activity_type']} - {data['activities']} attività"
 
-    # DRIVER RISCHIO
     slide = prs.slides.add_slide(prs.slide_layouts[5])
     slide.shapes.title.text = "Driver rischio"
 
@@ -211,13 +179,12 @@ def generate_ppt(nome, risk, level, df, actions, data):
         table.cell(i + 1, 0).text = str(row["Componente"])
         table.cell(i + 1, 1).text = str(round(row["Valore"]))
 
-    # AZIONI
     slide = prs.slides.add_slide(prs.slide_layouts[1])
-    slide.shapes.title.text = "Azioni suggerite"
+    slide.shapes.title.text = "Azioni"
 
     text = ""
-    for level_tag, action in actions:
-        text += f"{level_tag} - {action}\n"
+    for lvl, a in actions:
+        text += f"{lvl} - {a}\n"
 
     slide.placeholders[1].text = text
 
@@ -249,11 +216,9 @@ sub = st.number_input("Subappaltatori", 0, 50, 0)
 
 awareness = st.number_input("Sensibilizzazioni", 0, 1000, 0)
 
-# ✅ NUOVE SEZIONI
+# ✅ NUOVE FEATURES
 activity_type = st.selectbox("Tipologia attività", ["scavi", "elettrici", "altro"])
-activities = st.number_input("Numero attività in corso", 0, 20, 0)
-
-file = st.file_uploader("Excel criticità", type=["xlsx"])
+activities = st.number_input("Numero attività contemporanee", 0, 20, 0)
 
 
 # ==========================================
@@ -262,17 +227,12 @@ file = st.file_uploader("Excel criticità", type=["xlsx"])
 if st.button("Calcola"):
 
     nc_types = []
+
     if nc_data:
         for r in nc_data.split("|"):
             parts = r.split(",")
             if len(parts) == 2:
                 nc_types.append(parts[1].strip())
-
-    if file is not None:
-        df_excel = pd.read_excel(file)
-
-        if "Stato" in df_excel.columns:
-            crit_open = len(df_excel[df_excel["Stato"].str.lower() == "aperto"])
 
     data = {
         "inspections": inspections,
@@ -290,7 +250,8 @@ if st.button("Calcola"):
         "activities": activities
     }
 
-    risk, level, ncScore, stopScore, critScore, inspectionScore, complexityScore, activityScore = calculate_risk(data)
+    result = calculate_risk(data)
+    risk, level = result[0], result[1]
 
     actions = generate_actions(data)
 
@@ -299,7 +260,7 @@ if st.button("Calcola"):
 
     df = pd.DataFrame({
         "Componente": ["NC", "Stop Work", "Criticità", "Ispezioni", "Complessità", "Attività"],
-        "Valore": [ncScore, stopScore, critScore, inspectionScore, complexityScore, activityScore]
+        "Valore": list(result[2:])
     })
 
     st.bar_chart(df.set_index("Componente"))
@@ -313,4 +274,3 @@ if st.button("Calcola"):
     prs.save(buffer)
 
     st.download_button("📥 Scarica PPT", buffer.getvalue(), "HSE_Report.pptx")
-``

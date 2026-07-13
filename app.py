@@ -1,1015 +1,1246 @@
-from io import BytesIO
-from datetime import datetime
+from __future__ import annotations
+
+from html import escape
+from typing import Final
+from urllib.parse import quote
 
 import streamlit as st
-import pandas as pd
-from pptx import Presentation
-from pptx.util import Inches
 
 
-st.set_page_config(
-    page_title="HSE Risk Platform AI Locale",
-    page_icon="🦺",
-    layout="wide"
+# ============================================================
+# CONFIGURAZIONE
+# ============================================================
+
+APP_NAME: Final = "HSE Document Hub"
+APP_VERSION: Final = "1.1"
+
+SHAREPOINT_SITE_URL: Final = (
+    "https://enelcom.sharepoint.com/sites/"
+    "ArchivioDocumentaleHSECantieri"
 )
 
+SHAREPOINT_SITE_PATH: Final = (
+    "/sites/ArchivioDocumentaleHSECantieri"
+)
 
-NC_SEVERITY_WEIGHTS = {
-    "lieve": 2,
-    "media": 5,
-    "grave": 10,
-    "critica": 18
-}
+DOCUMENT_LIBRARY: Final = "Shared Documents"
+ROOT_FOLDER: Final = "Archivio Documentale HSE Cantieri"
 
-NC_THEME_WEIGHTS = {
-    "elettrico": 16,
-    "scavi": 16,
-    "quota": 14,
-    "sollevamento": 14,
-    "spazi confinati": 18,
-    "incendio": 14,
-    "viabilità": 10,
-    "dpi": 7,
-    "ordine e pulizia": 6,
-    "documentale": 5,
-    "ambientale": 8,
-    "altro": 6
-}
 
-ACTIVITY_WEIGHTS = {
-    "elettrici": 18,
-    "scavi": 18,
-    "lavori in quota": 16,
-    "sollevamenti": 16,
-    "spazi confinati": 20,
-    "hot work": 15,
-    "movimentazione mezzi": 12,
-    "civili": 8,
-    "meccanici": 10,
-    "altro": 6
-}
+# Devono corrispondere esattamente alle cartelle SharePoint.
+SITI: Final = [
+    "Udine BESS",
+    "Fusina BESS",
+    "Pontestura",
+    "La Spezia",
+    "Acate",
+    "Vizzini",
+]
 
-AWARENESS_BONUS = {
-    "rischio elettrico": 8,
-    "scavi e sottoservizi": 8,
-    "lavori in quota": 7,
-    "sollevamenti": 7,
-    "spazi confinati": 9,
-    "hot work / incendio": 7,
-    "viabilità e mezzi": 6,
-    "dpi": 4,
-    "ordine e pulizia": 4,
-    "toolbox generale": 3,
-    "altro": 2
-}
 
-LINKS_ACTIVITY_NC = {
-    "elettrici": ["elettrico"],
-    "scavi": ["scavi"],
-    "lavori in quota": ["quota"],
-    "sollevamenti": ["sollevamento"],
-    "spazi confinati": ["spazi confinati"],
-    "hot work": ["incendio"],
-    "movimentazione mezzi": ["viabilità"]
-}
+# Devono corrispondere esattamente alle sottocartelle SharePoint.
+CATEGORIE: Final = [
+    "Pre Job Check",
+    "Checklist Mezzi",
+    "Checklist Attrezzature",
+    "Sensibilizzazioni",
+    "Induction",
+    "Test",
+    "Procedure",
+    "Costi della sicurezza",
+    "Documentazione generica",
+]
 
-LINKS_AWARENESS_ACTIVITY = {
-    "rischio elettrico": ["elettrici"],
-    "scavi e sottoservizi": ["scavi"],
-    "lavori in quota": ["lavori in quota"],
-    "sollevamenti": ["sollevamenti"],
-    "spazi confinati": ["spazi confinati"],
-    "hot work / incendio": ["hot work"],
-    "viabilità e mezzi": ["movimentazione mezzi"],
-    "dpi": ["civili", "meccanici", "elettrici", "scavi"],
-    "ordine e pulizia": ["civili", "meccanici"]
+
+CATEGORY_ICONS: Final = {
+    "Pre Job Check": "🧾",
+    "Checklist Mezzi": "🚚",
+    "Checklist Attrezzature": "🛠️",
+    "Sensibilizzazioni": "📣",
+    "Induction": "🎓",
+    "Test": "🧪",
+    "Procedure": "📘",
+    "Costi della sicurezza": "💶",
+    "Documentazione generica": "📂",
 }
 
 
-def normalize_list(values):
-    return [v.strip().lower() for v in values if v.strip()]
+# ============================================================
+# FUNZIONI GENERALI
+# ============================================================
+
+def safe(value: object) -> str:
+    return escape(str(value or ""))
 
 
-def risk_level(risk):
-    if risk <= 20:
-        return "Basso"
-    elif risk <= 40:
-        return "Medio basso"
-    elif risk <= 60:
-        return "Medio"
-    elif risk <= 80:
-        return "Alto"
-    return "Critico"
+def render_html(content: str) -> None:
+    """
+    Visualizza HTML reale senza elaborazione Markdown.
+    In questo modo i tag <div> non vengono mai mostrati come testo.
+    """
+    st.html(content)
 
 
-def calculate_risk(data):
-    details = []
-    explanations = []
-
-    inspections = data["inspections"]
-    num_nc = data["num_nc"]
-    nc_items = data["nc_items"]
-    activities = data["activities"]
-    awareness_types = data["awareness_types"]
-    awareness_count = data["awareness_count"]
-
-    nc_score = 0
-
-    for item in nc_items:
-        theme = item["theme"]
-        severity = item["severity"]
-        theme_score = NC_THEME_WEIGHTS.get(theme, 6)
-        severity_score = NC_SEVERITY_WEIGHTS.get(severity, 5)
-        item_score = theme_score + severity_score
-        nc_score += item_score
-        explanations.append(f"NC su '{theme}' con gravità '{severity}': +{item_score} punti.")
-
-    nc_score = min(nc_score, 100)
-
-    nc_density = num_nc / max(inspections, 1)
-
-    if nc_density >= 1:
-        density_penalty = 25
-        explanations.append("Densità NC molto alta rispetto alle ispezioni: +25 punti.")
-    elif nc_density >= 0.5:
-        density_penalty = 15
-        explanations.append("Densità NC significativa rispetto alle ispezioni: +15 punti.")
-    elif nc_density >= 0.25:
-        density_penalty = 8
-        explanations.append("Densità NC moderata rispetto alle ispezioni: +8 punti.")
-    else:
-        density_penalty = 0
-
-    if inspections == 0 and num_nc > 0:
-        control_score = 30
-        explanations.append("NC presenti senza ispezioni registrate: +30 punti.")
-    elif inspections < 3 and num_nc >= 3:
-        control_score = 25
-        explanations.append("Poche ispezioni rispetto alle NC rilevate: +25 punti.")
-    elif inspections >= 20 and num_nc <= 2:
-        control_score = -10
-        explanations.append("Molte ispezioni con poche NC: -10 punti.")
-    elif inspections >= 10 and num_nc <= 2:
-        control_score = -5
-        explanations.append("Buon presidio ispettivo con poche NC: -5 punti.")
-    else:
-        control_score = 0
-
-    stop_score = min(data["stopworks"] * 10, 40)
-
-    if data["stopworks"] > 0:
-        explanations.append(f"{data['stopworks']} Stop Work registrati: +{stop_score} punti.")
-
-    crit_score = min(
-        data["crit_open"] * 12 +
-        data["crit_late"] * 10 +
-        data["crit_ontime"] * 3,
-        100
+def configure_page() -> None:
+    st.set_page_config(
+        page_title=APP_NAME,
+        page_icon="🛡️",
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
 
-    if data["crit_open"] > 0:
-        explanations.append(f"{data['crit_open']} criticità aperte: incremento rischio.")
 
-    if data["crit_late"] > 0:
-        explanations.append(f"{data['crit_late']} criticità risolte in ritardo: peggiora il follow-up.")
+def initialize_state() -> None:
+    defaults = {
+        "role": None,
+        "page": "home",
+        "selected_site": SITI[0],
+        "selected_category": CATEGORIE[0],
+    }
 
-    complexity_score = min(data["app"] * 5 + data["sub"] * 8, 70)
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-    if data["sub"] >= 5:
-        complexity_score += 15
-        explanations.append("Numero elevato di subappaltatori: +15 punti.")
 
-    complexity_score = min(complexity_score, 100)
+def go_to(page: str, role: str | None = None) -> None:
+    st.session_state.page = page
 
-    activity_score = 0
+    if role is not None:
+        st.session_state.role = role
 
-    for act in activities:
-        score = ACTIVITY_WEIGHTS.get(act, 6)
-        activity_score += score
-        explanations.append(f"Attività '{act}': +{score} punti.")
 
-    if len(activities) >= 3:
-        activity_score += 20
-        explanations.append("Tre o più attività contemporanee: +20 punti per interferenza.")
+# ============================================================
+# STILE
+# ============================================================
 
-    if len(activities) >= 5:
-        activity_score += 15
-        explanations.append("Cinque o più attività contemporanee: +15 punti aggiuntivi.")
+def apply_styles() -> None:
+    st.html(
+        """
+        <style>
+        :root {
+            --navy: #12304a;
+            --blue: #176b87;
+            --cyan: #24a3b6;
+            --ice: #eef6f8;
+            --line: #dbe6ea;
+            --muted: #647783;
+            --shadow: 0 10px 30px rgba(18, 48, 74, 0.08);
+        }
 
-    activity_score = min(activity_score, 100)
+        .stApp {
+            background:
+                radial-gradient(
+                    circle at 100% 0%,
+                    rgba(36, 163, 182, 0.11),
+                    transparent 28rem
+                ),
+                linear-gradient(
+                    180deg,
+                    #f8fbfc 0%,
+                    #f3f7f8 100%
+                );
+        }
 
-    correlation_penalty = 0
-    nc_themes = [item["theme"] for item in nc_items]
+        .block-container {
+            max-width: 1500px;
+            padding-top: 1.6rem;
+            padding-bottom: 4rem;
+        }
 
-    for act in activities:
-        expected_nc = LINKS_ACTIVITY_NC.get(act, [])
-        for theme in expected_nc:
-            if theme in nc_themes:
-                correlation_penalty += 15
-                explanations.append(f"Correlazione critica: attività '{act}' con NC su '{theme}': +15 punti.")
+        h1, h2, h3 {
+            color: var(--navy);
+        }
 
-    correlation_penalty = min(correlation_penalty, 45)
+        [data-testid="stSidebar"] {
+            background:
+                linear-gradient(
+                    180deg,
+                    #102d46 0%,
+                    #174f68 100%
+                );
+        }
 
-    fase_score = 0
+        [data-testid="stSidebar"] h1,
+        [data-testid="stSidebar"] h2,
+        [data-testid="stSidebar"] h3,
+        [data-testid="stSidebar"] p,
+        [data-testid="stSidebar"] label {
+            color: white !important;
+        }
 
-    if data["fase"] == "commissioning":
-        fase_score += 18
-        explanations.append("Fase commissioning: +18 punti per prove, energie e interferenze.")
-    elif data["fase"] == "punch list":
-        fase_score += 10
-        explanations.append("Fase punch list: +10 punti per attività residue e discontinuità operative.")
-    elif data["fase"] == "cantierizzazione":
-        fase_score += 8
-        explanations.append("Fase cantierizzazione: +8 punti per allestimenti e avvio attività.")
+        [data-testid="stSidebar"] .stButton > button {
+            background: rgba(255,255,255,0.12);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.22);
+        }
 
-    awareness_bonus = 0
+        [data-testid="stSidebar"] .stLinkButton > a {
+            background: rgba(255,255,255,0.12);
+            color: white !important;
+            border: 1px solid rgba(255,255,255,0.22);
+        }
 
-    for aw in awareness_types:
-        bonus = AWARENESS_BONUS.get(aw, 2)
-        awareness_bonus += bonus
-        explanations.append(f"Sensibilizzazione '{aw}': -{bonus} punti.")
+        [data-testid="stSidebar"] div[data-baseweb="select"] > div {
+            background: white !important;
+            color: #16232d !important;
+        }
 
-    if awareness_count >= 5:
-        awareness_bonus += 5
-        explanations.append("Numero adeguato di sensibilizzazioni: -5 punti.")
+        [data-testid="stSidebar"] div[data-baseweb="select"] span {
+            color: #16232d !important;
+        }
 
-    if awareness_count >= 10:
-        awareness_bonus += 5
-        explanations.append("Buona continuità nelle sensibilizzazioni: -5 punti.")
+        .hero {
+            padding: 2.2rem 2.4rem;
+            border-radius: 24px;
+            background:
+                linear-gradient(
+                    120deg,
+                    rgba(18,48,74,0.98),
+                    rgba(23,107,135,0.94)
+                );
+            box-shadow: var(--shadow);
+            color: white;
+            position: relative;
+            overflow: hidden;
+            margin-bottom: 1.4rem;
+        }
 
-    for aw in awareness_types:
-        covered_activities = LINKS_AWARENESS_ACTIVITY.get(aw, [])
-        for act in activities:
-            if act in covered_activities:
-                awareness_bonus += 5
-                explanations.append(f"Sensibilizzazione coerente con attività '{act}': -5 punti.")
+        .hero::after {
+            content: "";
+            width: 300px;
+            height: 300px;
+            border-radius: 50%;
+            position: absolute;
+            right: -80px;
+            top: -110px;
+            background: rgba(255,255,255,0.08);
+        }
 
-    awareness_bonus = min(awareness_bonus, 35)
+        .hero-kicker {
+            text-transform: uppercase;
+            font-size: 0.76rem;
+            letter-spacing: 0.14em;
+            font-weight: 700;
+            opacity: 0.82;
+            position: relative;
+            z-index: 1;
+        }
 
-    risk = (
-        nc_score * 0.20 +
-        crit_score * 0.15 +
-        activity_score * 0.20 +
-        complexity_score * 0.10 +
-        stop_score * 0.10 +
-        density_penalty +
-        control_score +
-        correlation_penalty +
-        fase_score -
-        awareness_bonus
+        .hero-title {
+            font-size: clamp(2rem, 4vw, 3.35rem);
+            line-height: 1.02;
+            font-weight: 800;
+            margin: 0.45rem 0 0.55rem;
+            position: relative;
+            z-index: 1;
+        }
+
+        .hero-copy {
+            max-width: 850px;
+            opacity: 0.90;
+            font-size: 1.03rem;
+            position: relative;
+            z-index: 1;
+        }
+
+        .metric-card,
+        .site-card,
+        .category-card,
+        .panel,
+        .access-card,
+        .process-step {
+            background: rgba(255,255,255,0.96);
+            border: 1px solid var(--line);
+            box-shadow: var(--shadow);
+            border-radius: 18px;
+        }
+
+        .metric-card {
+            min-height: 138px;
+            padding: 1.25rem 1.35rem;
+        }
+
+        .metric-label {
+            color: var(--muted);
+            font-size: 0.78rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+        }
+
+        .metric-value {
+            color: var(--navy);
+            font-size: 2rem;
+            font-weight: 800;
+            margin-top: 0.45rem;
+        }
+
+        .metric-foot {
+            color: var(--muted);
+            font-size: 0.82rem;
+            margin-top: 0.25rem;
+        }
+
+        .section-title {
+            color: var(--navy);
+            font-size: 1.35rem;
+            font-weight: 800;
+            margin: 1.6rem 0 0.85rem;
+        }
+
+        .site-card,
+        .category-card {
+            padding: 1.2rem 1.25rem;
+            min-height: 170px;
+            margin-bottom: 0.65rem;
+        }
+
+        .site-name,
+        .category-name {
+            color: var(--navy);
+            font-size: 1.12rem;
+            font-weight: 800;
+        }
+
+        .card-icon {
+            font-size: 1.7rem;
+            margin-bottom: 0.7rem;
+        }
+
+        .card-number {
+            color: var(--navy);
+            font-size: 1.85rem;
+            font-weight: 800;
+            margin-top: 0.8rem;
+        }
+
+        .card-caption,
+        .muted {
+            color: var(--muted);
+            font-size: 0.86rem;
+        }
+
+        .access-card {
+            border-radius: 22px;
+            padding: 1.8rem;
+            min-height: 250px;
+        }
+
+        .access-icon {
+            font-size: 2.2rem;
+        }
+
+        .access-title {
+            color: var(--navy);
+            font-size: 1.45rem;
+            font-weight: 800;
+            margin: 0.8rem 0 0.45rem;
+        }
+
+        .access-copy {
+            color: var(--muted);
+            min-height: 72px;
+        }
+
+        .success-banner,
+        .small-banner,
+        .warning-banner {
+            padding: 0.9rem 1rem;
+            border-radius: 14px;
+            margin-bottom: 1rem;
+        }
+
+        .success-banner {
+            background: #eaf7f0;
+            border: 1px solid #c9e9d6;
+            color: #195e3a;
+        }
+
+        .small-banner {
+            background: #eef6f8;
+            border: 1px solid #dbe9ed;
+            color: #365463;
+        }
+
+        .warning-banner {
+            background: #fff8e5;
+            border: 1px solid #f1dfaa;
+            color: #705715;
+        }
+
+        .panel {
+            padding: 1.4rem;
+            margin-top: 1rem;
+        }
+
+        .process-step {
+            padding: 1rem 1.1rem;
+            min-height: 130px;
+            margin-bottom: 0.8rem;
+        }
+
+        .process-number {
+            color: var(--cyan);
+            font-size: 1.45rem;
+            font-weight: 900;
+        }
+
+        .process-title {
+            color: var(--navy);
+            font-size: 1rem;
+            font-weight: 800;
+            margin-top: 0.25rem;
+        }
+
+        .process-copy {
+            color: var(--muted);
+            font-size: 0.85rem;
+            margin-top: 0.3rem;
+        }
+
+        .stButton > button,
+        .stLinkButton > a {
+            border-radius: 11px;
+            font-weight: 750;
+            min-height: 42px;
+        }
+
+        .stButton > button[kind="primary"] {
+            background:
+                linear-gradient(
+                    90deg,
+                    #176b87,
+                    #1b829e
+                );
+            border: none;
+        }
+
+        .footer {
+            margin-top: 2rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--line);
+            color: var(--muted);
+            font-size: 0.8rem;
+            text-align: center;
+        }
+        </style>
+        """
     )
 
-    risk = max(0, min(100, risk))
-    level = risk_level(risk)
 
-    details.append(("NC", nc_score))
-    details.append(("Criticità", crit_score))
-    details.append(("Attività", activity_score))
-    details.append(("Complessità", complexity_score))
-    details.append(("Stop Work", stop_score))
-    details.append(("Densità NC", density_penalty))
-    details.append(("Controllo", control_score))
-    details.append(("Correlazioni critiche", correlation_penalty))
-    details.append(("Fase", fase_score))
-    details.append(("Bonus sensibilizzazioni", -awareness_bonus))
+# ============================================================
+# LINK SHAREPOINT
+# ============================================================
 
-    return risk, level, details, explanations
-
-
-def generate_base_actions(data, risk, level):
-    actions = []
-
-    nc_themes = [item["theme"] for item in data["nc_items"]]
-    severe_nc = [item for item in data["nc_items"] if item["severity"] in ["grave", "critica"]]
-
-    if risk >= 80:
-        actions.append(("MUST HAVE", "🔴 Rischio critico: convocare coordinamento operativo immediato e validare piano azioni prima della prosecuzione."))
-
-    if severe_nc:
-        actions.append(("MUST HAVE", f"🔴 Presenti {len(severe_nc)} NC gravi/critiche. Definire responsabile, scadenza e verifica chiusura."))
-
-    for act in data["activities"]:
-        if act == "elettrici":
-            actions.append(("MUST HAVE", "⚡ Verificare sezionamenti, LOTO, autorizzazioni, DPI e competenze PES/PAV/PEI."))
-        if act == "scavi":
-            actions.append(("MUST HAVE", "🚧 Verificare sottoservizi, stabilità fronti, accessi, delimitazioni e presenza acqua/materiale instabile."))
-        if act == "lavori in quota":
-            actions.append(("MUST HAVE", "🪜 Verificare parapetti, ancoraggi, PLE, imbracature, accessi e piano di emergenza."))
-        if act == "sollevamenti":
-            actions.append(("MUST HAVE", "🏗️ Verificare piano di sollevamento, portate, accessori, interferenze e area segregata."))
-        if act == "spazi confinati":
-            actions.append(("MUST HAVE", "☠️ Verificare autorizzazione, monitoraggio atmosfera, recupero emergenza e presidio esterno."))
-        if act == "hot work":
-            actions.append(("MUST HAVE", "🔥 Verificare permesso hot work, estintori, rimozione combustibili, fire watch e controllo post-attività."))
-
-    if len(data["activities"]) >= 3:
-        actions.append(("MUST HAVE", "🔴 Predisporre matrice interferenziale giornaliera e briefing pre-job tra imprese."))
-
-    if "elettrico" in nc_themes:
-        actions.append(("MUST HAVE", "🔴 NC elettriche: sospendere attività non conformi fino a ripristino condizioni sicure."))
-
-    if "scavi" in nc_themes:
-        actions.append(("MUST HAVE", "🔴 NC su scavi: rivalutare condizioni dello scavo e sottoservizi prima della prosecuzione."))
-
-    if "quota" in nc_themes:
-        actions.append(("MUST HAVE", "🔴 NC lavori in quota: verifica immediata protezioni collettive e sistemi anticaduta."))
-
-    if data["awareness_count"] == 0:
-        actions.append(("MUST HAVE", "🟡 Nessuna sensibilizzazione registrata: pianificare toolbox mirati prima delle attività critiche."))
-
-    missing_awareness = []
-
-    if "elettrici" in data["activities"] and "rischio elettrico" not in data["awareness_types"]:
-        missing_awareness.append("rischio elettrico")
-    if "scavi" in data["activities"] and "scavi e sottoservizi" not in data["awareness_types"]:
-        missing_awareness.append("scavi e sottoservizi")
-    if "lavori in quota" in data["activities"] and "lavori in quota" not in data["awareness_types"]:
-        missing_awareness.append("lavori in quota")
-    if "sollevamenti" in data["activities"] and "sollevamenti" not in data["awareness_types"]:
-        missing_awareness.append("sollevamenti")
-
-    if missing_awareness:
-        actions.append(("MUST HAVE", "🟠 Mancano sensibilizzazioni mirate su: " + ", ".join(missing_awareness) + "."))
-
-    if data["crit_open"] > 0:
-        actions.append(("MUST HAVE", f"🟠 Criticità aperte: {data['crit_open']}. Definire priorità, owner e data di chiusura."))
-
-    if data["crit_late"] > 0:
-        actions.append(("MUST HAVE", f"🟠 Criticità chiuse in ritardo: {data['crit_late']}. Analizzare cause del ritardo e capacità di follow-up."))
-
-    if level in ["Basso", "Medio basso"]:
-        actions.append(("NICE TO HAVE", "🟢 Mantenere trend positivo con ispezioni mirate, tracciamento NC e toolbox brevi sulle attività del giorno."))
-
-    if len(actions) < 4:
-        actions.append(("IDEA", "Mantenere presidio operativo e aggiornare la valutazione rischio in caso di nuove attività o nuove imprese."))
-
-    return actions
-
-
-def local_executive_summary(data, risk, level, driver_df):
-    top_drivers = driver_df.sort_values("Valore", ascending=False).head(3)
-    top_text = ", ".join(f"{row['Driver']} ({round(row['Valore'], 1)})" for _, row in top_drivers.iterrows())
-
-    activities = ", ".join(data["activities"]) if data["activities"] else "nessuna attività critica selezionata"
-    awareness = ", ".join(data["awareness_types"]) if data["awareness_types"] else "nessuna sensibilizzazione mirata"
-
-    if level in ["Alto", "Critico"]:
-        decision = "Si raccomanda un coordinamento operativo immediato, con verifica delle attività critiche, chiusura delle NC prioritarie e briefing pre-job prima della prosecuzione."
-    elif level == "Medio":
-        decision = "Si raccomanda di rafforzare il presidio operativo, chiudere le criticità aperte e programmare sensibilizzazioni mirate sulle attività più esposte."
-    else:
-        decision = "Il livello è sotto controllo, ma va mantenuto il monitoraggio periodico e l’aggiornamento della valutazione in caso di variazioni operative."
-
-    return f"""
-Il cantiere **{data['nome']}** presenta un Risk Index pari a **{round(risk)} / 100**, classificato come **{level}**.
-
-I principali driver che influenzano il rischio sono: **{top_text}**.
-
-Le attività in corso sono: **{activities}**.  
-Le sensibilizzazioni registrate sono: **{awareness}**.
-
-{decision}
-"""
-
-
-def local_root_cause(data, risk, level):
-    nc_themes = [item["theme"] for item in data["nc_items"]]
-    severe_nc = [item for item in data["nc_items"] if item["severity"] in ["grave", "critica"]]
-
-    causes = []
-
-    if severe_nc:
-        causes.append("presenza di NC gravi o critiche non ancora compensate da azioni correttive robuste")
-    if len(data["activities"]) >= 3:
-        causes.append("elevato rischio interferenziale dovuto alla contemporaneità delle attività")
-    if data["crit_open"] > 0:
-        causes.append("presenza di criticità aperte che aumentano l’esposizione residua")
-    if data["crit_late"] > 0:
-        causes.append("ritardi nella chiusura delle criticità, indice di follow-up non pienamente efficace")
-    if data["sub"] >= 5:
-        causes.append("complessità organizzativa elevata per numero significativo di subappaltatori")
-    if data["awareness_count"] == 0:
-        causes.append("assenza di sensibilizzazioni registrate")
-
-    if not causes:
-        causes.append("nessuna causa dominante evidente; il rischio deriva dalla combinazione dei fattori inseriti")
-
-    controls = []
-
-    if "elettrico" in nc_themes or "elettrici" in data["activities"]:
-        controls.append("verifica LOTO, sezionamenti, autorizzazioni elettriche e competenze PES/PAV/PEI")
-    if "scavi" in nc_themes or "scavi" in data["activities"]:
-        controls.append("verifica sottoservizi, stabilità fronti, accessi e segregazione scavi")
-    if "quota" in nc_themes or "lavori in quota" in data["activities"]:
-        controls.append("verifica protezioni collettive, ancoraggi, PLE e DPI anticaduta")
-    if "sollevamenti" in data["activities"]:
-        controls.append("verifica piano di sollevamento, portate, accessori e area segregata")
-
-    if not controls:
-        controls.append("verifica controlli operativi standard, briefing pre-job e tracciamento NC")
-
-    return f"""
-### Cause probabili
-{chr(10).join(["- " + c for c in causes])}
-
-### Debolezze organizzative possibili
-- Pianificazione operativa non pienamente allineata ai rischi reali di campo.
-- Follow-up delle criticità da rafforzare.
-- Presidio delle interferenze da formalizzare meglio quando sono presenti più attività.
-
-### Controlli da verificare
-{chr(10).join(["- " + c for c in controls])}
-
-### Conclusione operativa
-Il livello **{level}** richiede un piano azioni proporzionato al rischio, con priorità alle attività critiche, alle NC gravi/critiche e alle criticità ancora aperte.
-"""
-
-
-def local_toolbox_talk(data):
-    activities = data["activities"]
-    nc_themes = [item["theme"] for item in data["nc_items"]]
-
-    title_parts = []
-
-    if activities:
-        title_parts.extend(activities[:2])
-    if nc_themes:
-        title_parts.extend(nc_themes[:2])
-
-    title = " / ".join(title_parts) if title_parts else "Sicurezza operativa giornaliera"
-
-    rules = [
-        "Non iniziare attività senza autorizzazione e briefing pre-job.",
-        "Segnalare immediatamente condizioni non sicure o interferenze.",
-        "Mantenere l’area ordinata, accessibile e segregata dove necessario.",
-        "Usare DPI coerenti con il rischio specifico dell’attività.",
-        "Fermare l’attività in caso di dubbio o condizione non controllata."
+def sharepoint_folder_path(
+    site: str | None = None,
+    category: str | None = None,
+) -> str:
+    parts = [
+        SHAREPOINT_SITE_PATH,
+        DOCUMENT_LIBRARY,
+        ROOT_FOLDER,
     ]
 
-    if "elettrici" in activities or "elettrico" in nc_themes:
-        rules.append("Per attività elettriche: verificare sezionamento, assenza tensione e procedura LOTO.")
-    if "scavi" in activities or "scavi" in nc_themes:
-        rules.append("Per scavi: verificare sottoservizi, stabilità fronti e accessi sicuri.")
-    if "lavori in quota" in activities or "quota" in nc_themes:
-        rules.append("Per lavori in quota: verificare protezioni anticaduta prima di accedere all’area.")
-    if "sollevamenti" in activities:
-        rules.append("Per sollevamenti: nessuno deve sostare sotto carichi sospesi o in area non autorizzata.")
+    if site:
+        parts.append(site)
 
-    return f"""
-### Titolo
-**Toolbox Talk - {title}**
+    if category:
+        parts.append(category)
 
-### Obiettivo
-Allineare la squadra sui rischi principali della giornata e sulle condizioni minime per lavorare in sicurezza.
-
-### Rischi principali
-- Attività in corso: **{", ".join(activities) if activities else "non specificate"}**
-- NC rilevate: **{", ".join(nc_themes) if nc_themes else "nessuna NC dettagliata"}**
-- Fase del cantiere: **{data["fase"]}**
-
-### Regole operative
-{chr(10).join(["- " + r for r in rules])}
-
-### Comportamenti vietati
-- Improvvisare lavorazioni fuori procedura.
-- Rimuovere protezioni o segregazioni senza autorizzazione.
-- Operare in aree interferenti senza coordinamento.
-- Proseguire il lavoro dopo una condizione di pericolo non risolta.
-
-### Domande finali alla squadra
-1. Qual è il rischio principale dell’attività di oggi?
-2. Quali autorizzazioni servono prima di iniziare?
-3. Quali DPI sono obbligatori?
-4. Chi avviso se cambia la condizione di lavoro?
-5. Quando devo fermare l’attività?
-"""
+    return "/" + "/".join(
+        part.strip("/")
+        for part in parts
+    ).lstrip("/")
 
 
-def local_action_plan(data, risk, level):
-    rows = []
-
-    if risk >= 80:
-        rows.append(["Coordinamento HSE immediato", "Critica", "Site Manager / HSE", "Immediata", "Verbale briefing e piano azioni"])
-    if data["crit_open"] > 0:
-        rows.append(["Chiudere criticità aperte prioritarie", "Alta", "HSE / Responsabile impresa", "24-48h", "Registro criticità aggiornato"])
-    if data["crit_late"] > 0:
-        rows.append(["Analizzare ritardi chiusura criticità", "Media", "HSE Manager", "7 giorni", "Analisi cause e azioni correttive"])
-    if len(data["activities"]) >= 3:
-        rows.append(["Creare matrice interferenze giornaliera", "Alta", "Construction Manager", "24h", "Matrice interferenze firmata"])
-    if "elettrici" in data["activities"]:
-        rows.append(["Verifica attività elettriche e LOTO", "Alta", "Preposto / HSE", "24h", "Checklist elettrica e autorizzazioni"])
-    if "scavi" in data["activities"]:
-        rows.append(["Verifica sicurezza scavi", "Alta", "Preposto / HSE", "24h", "Checklist scavi e verifica sottoservizi"])
-    if "lavori in quota" in data["activities"]:
-        rows.append(["Verifica lavori in quota", "Alta", "Preposto / HSE", "24h", "Checklist quota / PLE / ancoraggi"])
-    if data["awareness_count"] == 0:
-        rows.append(["Eseguire toolbox mirato", "Alta", "HSE / Preposto", "Prima dell’attività", "Registro presenze toolbox"])
-
-    missing = []
-
-    if "elettrici" in data["activities"] and "rischio elettrico" not in data["awareness_types"]:
-        missing.append("rischio elettrico")
-    if "scavi" in data["activities"] and "scavi e sottoservizi" not in data["awareness_types"]:
-        missing.append("scavi e sottoservizi")
-    if "lavori in quota" in data["activities"] and "lavori in quota" not in data["awareness_types"]:
-        missing.append("lavori in quota")
-
-    if missing:
-        rows.append(["Eseguire sensibilizzazioni mirate: " + ", ".join(missing), "Media", "HSE", "48h", "Registro sensibilizzazioni"])
-
-    if not rows:
-        rows.append(["Mantenere monitoraggio HSE periodico", "Media", "HSE", "7 giorni", "Report ispezione aggiornato"])
-
-    return pd.DataFrame(rows, columns=["Azione", "Priorità", "Owner suggerito", "Scadenza", "Evidenza richiesta"])
-
-
-def local_reduce_risk(data, risk):
-    target = 80 if risk > 80 else 60 if risk > 60 else 40 if risk > 40 else 20
-
-    levers = []
-
-    if data["crit_open"] > 0:
-        levers.append("Chiudere le criticità aperte più rilevanti può ridurre in modo significativo il rischio residuo.")
-    if len(data["activities"]) >= 3:
-        levers.append("Ridurre o separare temporalmente le attività contemporanee abbassa il rischio interferenziale.")
-    if data["awareness_count"] == 0:
-        levers.append("Eseguire toolbox mirati sulle attività critiche genera mitigazione immediata.")
-    if data["num_nc"] > 0:
-        levers.append("Chiudere NC gravi/critiche con verifica di efficacia riduce il driver NC e le correlazioni critiche.")
-    if data["sub"] >= 5:
-        levers.append("Rafforzare coordinamento subappaltatori e responsabilità operative riduce la complessità.")
-    if "elettrici" in data["activities"]:
-        levers.append("Verificare LOTO, autorizzazioni e competenze elettriche riduce il rischio su attività elettriche.")
-    if "scavi" in data["activities"]:
-        levers.append("Verificare sottoservizi, fronti e segregazioni riduce il rischio operativo sugli scavi.")
-
-    if not levers:
-        levers.append("Mantenere controlli periodici, sensibilizzazioni mirate e aggiornamento del rischio al cambio attività.")
-
-    return f"""
-### Obiettivo suggerito
-Portare il Risk Index sotto **{target}**.
-
-### Leve principali
-{chr(10).join(["- " + l for l in levers])}
-
-### Strategia consigliata
-Agire prima sui fattori che generano rischio diretto: **NC gravi/critiche, criticità aperte, attività contemporanee e assenza di sensibilizzazioni mirate**.
-"""
-
-
-def local_hse_advisor(question, data, risk, level, actions_df):
-    q = question.lower()
-
-    if "24" in q or "domani" in q or "subito" in q:
-        return """
-Nelle prossime 24 ore darei priorità a:
-
-1. Verifica delle attività critiche in corso.
-2. Chiusura o messa in sicurezza delle NC gravi/critiche.
-3. Briefing pre-job con imprese coinvolte.
-4. Verifica criticità aperte.
-5. Sensibilizzazione mirata sulle attività più rischiose.
-"""
-
-    if "principale" in q or "rischio" in q:
-        top_actions = actions_df.head(3)["Azione"].tolist()
-        return "Il rischio principale emerge dalla combinazione tra attività critiche, NC e criticità aperte. Azioni prioritarie:\n\n" + "\n".join(["- " + a for a in top_actions])
-
-    if "ridurre" in q or "abbassare" in q:
-        return local_reduce_risk(data, risk)
-
-    if "fermare" in q or "stop" in q:
-        if level in ["Alto", "Critico"]:
-            return "Con livello Alto/Critico valuterei stop o sospensione selettiva delle attività non controllate, soprattutto se correlate a NC gravi, scavi, elettrico, quota, sollevamenti o spazi confinati."
-        return "Non emerge automaticamente una necessità di fermare le attività, ma va applicato Stop Work se compaiono condizioni non sicure."
-
-    return """
-Risposta HSE Advisor locale:
-
-Valuta prima NC gravi/critiche, criticità aperte, attività contemporanee, coerenza delle sensibilizzazioni e fase del cantiere.
-
-Le azioni devono essere proporzionate al livello di rischio e tracciate con owner, scadenza ed evidenza.
-"""
-
-
-def generate_ppt(nome, risk, level, driver_df, actions_df, action_plan_df, summary, root_cause, toolbox, data):
-    prs = Presentation()
-
-    slide = prs.slides.add_slide(prs.slide_layouts[0])
-    slide.shapes.title.text = "HSE Risk Report"
-    slide.placeholders[1].text = f"Cantiere: {nome}\nData: {datetime.now().strftime('%d/%m/%Y')}"
-
-    slide = prs.slides.add_slide(prs.slide_layouts[1])
-    slide.shapes.title.text = "Executive Summary"
-    slide.placeholders[1].text = summary.replace("**", "")[:1600]
-
-    slide = prs.slides.add_slide(prs.slide_layouts[1])
-    slide.shapes.title.text = "Sintesi rischio"
-    slide.placeholders[1].text = (
-        f"Risk Index: {round(risk)} / 100\n"
-        f"Livello: {level}\n\n"
-        f"Fase: {data['fase']}\n"
-        f"Attività: {', '.join(data['activities']) if data['activities'] else 'Nessuna'}\n"
-        f"Sensibilizzazioni: {', '.join(data['awareness_types']) if data['awareness_types'] else 'Nessuna'}"
+def sharepoint_folder_url(
+    site: str | None = None,
+    category: str | None = None,
+) -> str:
+    folder_path = sharepoint_folder_path(
+        site=site,
+        category=category,
     )
 
-    slide = prs.slides.add_slide(prs.slide_layouts[5])
-    slide.shapes.title.text = "Driver rischio"
-
-    table = slide.shapes.add_table(
-        len(driver_df) + 1,
-        2,
-        Inches(0.8),
-        Inches(1.4),
-        Inches(8),
-        Inches(4.5)
-    ).table
-
-    table.cell(0, 0).text = "Driver"
-    table.cell(0, 1).text = "Valore"
-
-    for i, row in driver_df.iterrows():
-        table.cell(i + 1, 0).text = str(row["Driver"])
-        table.cell(i + 1, 1).text = str(round(row["Valore"], 1))
-
-    slide = prs.slides.add_slide(prs.slide_layouts[1])
-    slide.shapes.title.text = "Action Plan"
-    text = ""
-    for _, row in action_plan_df.head(7).iterrows():
-        text += f"{row['Priorità']} - {row['Azione']} - {row['Scadenza']}\n"
-    slide.placeholders[1].text = text[:1800]
-
-    slide = prs.slides.add_slide(prs.slide_layouts[1])
-    slide.shapes.title.text = "Root Cause Analysis"
-    slide.placeholders[1].text = root_cause.replace("###", "").replace("**", "")[:1800]
-
-    slide = prs.slides.add_slide(prs.slide_layouts[1])
-    slide.shapes.title.text = "Toolbox Talk"
-    slide.placeholders[1].text = toolbox.replace("###", "").replace("**", "")[:1800]
-
-    return prs
-
-
-def generate_excel(nome, risk, level, driver_df, actions_df, action_plan_df, explanations_df, summary, root_cause, toolbox, reduce_risk, data):
-    buffer = BytesIO()
-
-    summary_df = pd.DataFrame([{
-        "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "Cantiere": nome,
-        "Risk Index": round(risk, 1),
-        "Livello": level,
-        "Fase": data["fase"],
-        "Ispezioni": data["inspections"],
-        "NC": data["num_nc"],
-        "Stop Work": data["stopworks"],
-        "Criticità aperte": data["crit_open"],
-        "Criticità in tempo": data["crit_ontime"],
-        "Criticità in ritardo": data["crit_late"],
-        "Appaltatori": data["app"],
-        "Subappaltatori": data["sub"],
-        "Sensibilizzazioni numero": data["awareness_count"],
-        "Tipologie attività": ", ".join(data["activities"]),
-        "Tipologie sensibilizzazioni": ", ".join(data["awareness_types"])
-    }])
-
-    local_outputs_df = pd.DataFrame([
-        {"Sezione": "Executive Summary", "Testo": summary},
-        {"Sezione": "Root Cause Analysis", "Testo": root_cause},
-        {"Sezione": "Toolbox Talk", "Testo": toolbox},
-        {"Sezione": "Come ridurre il rischio", "Testo": reduce_risk}
-    ])
-
-    nc_df = pd.DataFrame(data["nc_items"])
-
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, sheet_name="Sintesi", index=False)
-        driver_df.to_excel(writer, sheet_name="Driver rischio", index=False)
-        actions_df.to_excel(writer, sheet_name="Azioni base", index=False)
-        action_plan_df.to_excel(writer, sheet_name="Action Plan", index=False)
-        explanations_df.to_excel(writer, sheet_name="Motivazione", index=False)
-        local_outputs_df.to_excel(writer, sheet_name="Output locali", index=False)
-        nc_df.to_excel(writer, sheet_name="NC dettaglio", index=False)
-
-    buffer.seek(0)
-    return buffer
-
-
-def run_calculation(data):
-    risk, level, details, explanations = calculate_risk(data)
-    base_actions = generate_base_actions(data, risk, level)
-
-    driver_df = pd.DataFrame(details, columns=["Driver", "Valore"])
-    actions_df = pd.DataFrame(base_actions, columns=["Priorità", "Azione"])
-    explanations_df = pd.DataFrame(explanations, columns=["Motivazione"])
-
-    summary = local_executive_summary(data, risk, level, driver_df)
-    root_cause = local_root_cause(data, risk, level)
-    toolbox = local_toolbox_talk(data)
-    action_plan_df = local_action_plan(data, risk, level)
-    reduce_risk = local_reduce_risk(data, risk)
-
-    st.session_state.report = {
-        "data": data,
-        "risk": risk,
-        "level": level,
-        "driver_df": driver_df,
-        "actions_df": actions_df,
-        "explanations_df": explanations_df,
-        "summary": summary,
-        "root_cause": root_cause,
-        "toolbox": toolbox,
-        "action_plan_df": action_plan_df,
-        "reduce_risk": reduce_risk
-    }
-
-    st.session_state.calcolo_effettuato = True
-
-
-if "calcolo_effettuato" not in st.session_state:
-    st.session_state.calcolo_effettuato = False
-
-if "advisor_answer" not in st.session_state:
-    st.session_state.advisor_answer = ""
-
-
-st.title("🦺 HSE Risk Platform AI Locale")
-st.caption("Risk assessment HSE con Executive Summary, Root Cause, Toolbox Talk, Action Plan e Advisor locale gratuito.")
-st.success("Modalità gratuita attiva: nessuna API key richiesta, nessun costo OpenAI.")
-
-
-with st.sidebar:
-    st.header("📋 Dati cantiere")
-
-    nome = st.text_input("Nome cantiere", value="Cantiere Demo")
-
-    fase = st.selectbox(
-        "Fase",
-        ["cantierizzazione", "costruzione", "commissioning", "punch list"]
+    encoded_path = quote(
+        folder_path,
+        safe="",
     )
 
-    st.divider()
-
-    st.header("🔍 Controlli e NC")
-
-    inspections = st.number_input("Numero ispezioni", 0, 1000, 10)
-    num_nc = st.number_input("Numero totale NC", 0, 300, 0)
-
-    nc_items = []
-
-    nc_count_detail = st.number_input(
-        "Quante NC vuoi dettagliare?",
-        0,
-        20,
-        min(num_nc, 3)
+    return (
+        f"{SHAREPOINT_SITE_URL}/"
+        f"{quote(DOCUMENT_LIBRARY, safe='')}/"
+        f"Forms/AllItems.aspx"
+        f"?id={encoded_path}"
     )
 
-    for i in range(nc_count_detail):
-        col1, col2 = st.columns(2)
 
-        with col1:
-            theme = st.selectbox(
-                f"Tema NC {i + 1}",
-                list(NC_THEME_WEIGHTS.keys()),
-                key=f"nc_theme_{i}"
-            )
+# ============================================================
+# COMPONENTI
+# ============================================================
 
-        with col2:
-            severity = st.selectbox(
-                f"Gravità NC {i + 1}",
-                list(NC_SEVERITY_WEIGHTS.keys()),
-                key=f"nc_severity_{i}"
-            )
-
-        nc_items.append({
-            "theme": theme,
-            "severity": severity
-        })
-
-    st.divider()
-
-    st.header("⛔ Stop Work e criticità")
-
-    stopworks = st.number_input("Stop Work", 0, 100, 0)
-    crit_open = st.number_input("Criticità aperte", 0, 200, 0)
-    crit_ontime = st.number_input("Criticità risolte in tempo", 0, 200, 0)
-    crit_late = st.number_input("Criticità risolte in ritardo", 0, 200, 0)
-
-    st.divider()
-
-    st.header("🏗️ Organizzazione")
-
-    app = st.number_input("Appaltatori", 0, 100, 1)
-    sub = st.number_input("Subappaltatori", 0, 100, 0)
-
-    st.divider()
-
-    st.header("⚙️ Attività in corso")
-
-    activities = st.multiselect(
-        "Tipologie attività presenti",
-        list(ACTIVITY_WEIGHTS.keys()),
-        default=["civili"]
+def render_header(title: str, subtitle: str) -> None:
+    render_html(
+        f"""
+        <div class="hero">
+            <div class="hero-kicker">Portale HSE cantieri</div>
+            <div class="hero-title">{safe(title)}</div>
+            <div class="hero-copy">{safe(subtitle)}</div>
+        </div>
+        """
     )
 
-    st.divider()
 
-    st.header("🧠 Sensibilizzazioni")
-
-    awareness_count = st.number_input(
-        "Numero sensibilizzazioni effettuate",
-        0,
-        1000,
-        0
+def metric_card(label: str, value: object, foot: str) -> None:
+    render_html(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">{safe(label)}</div>
+            <div class="metric-value">{safe(value)}</div>
+            <div class="metric-foot">{safe(foot)}</div>
+        </div>
+        """
     )
 
-    awareness_types = st.multiselect(
-        "Tipologie sensibilizzazioni effettuate",
-        list(AWARENESS_BONUS.keys())
+
+def render_footer() -> None:
+    render_html(
+        f"""
+        <div class="footer">
+            HSE Document Hub · Archivio documentale cantieri
+            · Versione {APP_VERSION}
+        </div>
+        """
     )
 
-    st.divider()
 
-    calcola = st.button("Calcola rischio", type="primary")
+# ============================================================
+# SIDEBAR
+# ============================================================
 
+def render_sidebar() -> None:
+    if st.session_state.page == "home":
+        return
 
-if calcola:
-    data = {
-        "nome": nome,
-        "fase": fase,
-        "inspections": inspections,
-        "num_nc": num_nc,
-        "nc_items": nc_items,
-        "stopworks": stopworks,
-        "crit_open": crit_open,
-        "crit_ontime": crit_ontime,
-        "crit_late": crit_late,
-        "app": app,
-        "sub": sub,
-        "activities": normalize_list(activities),
-        "awareness_count": awareness_count,
-        "awareness_types": normalize_list(awareness_types)
-    }
-
-    run_calculation(data)
-
-
-if not st.session_state.calcolo_effettuato:
-    st.info("Compila i dati nella sidebar e clicca su **Calcola rischio**.")
-    st.stop()
-
-
-report = st.session_state.report
-
-data = report["data"]
-risk = report["risk"]
-level = report["level"]
-driver_df = report["driver_df"]
-actions_df = report["actions_df"]
-explanations_df = report["explanations_df"]
-summary = report["summary"]
-root_cause = report["root_cause"]
-toolbox = report["toolbox"]
-action_plan_df = report["action_plan_df"]
-reduce_risk = report["reduce_risk"]
-
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("Risk Index", f"{round(risk)} / 100")
-col2.metric("Livello", level)
-col3.metric("NC", data["num_nc"])
-col4.metric("Attività", len(data["activities"]))
-
-st.divider()
-
-left, right = st.columns([1.2, 1])
-
-with left:
-    st.subheader("📊 Driver rischio")
-    st.bar_chart(driver_df.set_index("Driver"))
-
-with right:
-    st.subheader("🤖 Executive Summary locale")
-    st.markdown(summary)
-
-    if data["awareness_count"] > 0 and not data["awareness_types"]:
-        st.warning("Hai inserito sensibilizzazioni senza tipologia: seleziona le tipologie per valorizzarle meglio.")
-
-    if data["num_nc"] > len(data["nc_items"]):
-        st.warning(f"Hai indicato {data['num_nc']} NC totali ma ne hai dettagliate solo {len(data['nc_items'])}.")
-
-
-st.divider()
-
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "🎯 Azioni base",
-    "📋 Action Plan",
-    "🔍 Root Cause",
-    "🧰 Toolbox Talk",
-    "📉 Riduci rischio",
-    "💬 HSE Advisor",
-    "📤 Export"
-])
-
-with tab1:
-    st.subheader("Azioni base generate dal motore rischio")
-    st.dataframe(actions_df, use_container_width=True)
-
-    st.subheader("Motivazione tecnica del calcolo")
-    st.dataframe(explanations_df, use_container_width=True)
-
-with tab2:
-    st.subheader("Action Plan operativo")
-    st.dataframe(action_plan_df, use_container_width=True)
-
-with tab3:
-    st.subheader("Root Cause Analysis locale")
-    st.markdown(root_cause)
-
-with tab4:
-    st.subheader("Toolbox Talk locale")
-    st.markdown(toolbox)
-
-with tab5:
-    st.subheader("Come ridurre il rischio")
-    st.markdown(reduce_risk)
-
-with tab6:
-    st.subheader("Chiedi all'HSE Advisor locale")
-
-    question = st.text_input(
-        "Fai una domanda sul report",
-        placeholder="Esempio: cosa devo fare nelle prossime 24 ore?",
-        key="advisor_question"
+    role_label = (
+        "Accesso Enel"
+        if st.session_state.role == "enel"
+        else "Accesso Imprese"
     )
 
-    if st.button("Chiedi all'Advisor", key="advisor_button"):
-        if question.strip():
-            st.session_state.advisor_answer = local_hse_advisor(
-                question,
-                data,
-                risk,
-                level,
-                actions_df
-            )
+    with st.sidebar:
+        st.markdown("## 🛡️ HSE Document Hub")
+        st.caption(role_label)
+        st.divider()
+
+        if st.session_state.role == "enel":
+            if st.button("▦ Dashboard", width="stretch"):
+                go_to("enel_dashboard")
+                st.rerun()
+
+            if st.button("⌕ Ricerca documenti", width="stretch"):
+                go_to("search")
+                st.rerun()
+
+            if st.button("▤ Gestione archivio", width="stretch"):
+                go_to("documents")
+                st.rerun()
+
         else:
-            st.session_state.advisor_answer = "Scrivi una domanda."
+            if st.button("⬆ Carica documenti", width="stretch"):
+                go_to("company_upload")
+                st.rerun()
 
-    if st.session_state.advisor_answer:
-        st.markdown(st.session_state.advisor_answer)
+            if st.button("▤ Consulta archivio", width="stretch"):
+                go_to("company_documents")
+                st.rerun()
 
-with tab7:
-    st.subheader("Download report")
+        st.divider()
+        st.caption("Navigazione rapida")
 
-    ppt = generate_ppt(
-        data["nome"],
-        risk,
-        level,
-        driver_df,
-        actions_df,
-        action_plan_df,
-        summary,
-        root_cause,
-        toolbox,
-        data
-    )
-
-    ppt_buffer = BytesIO()
-    ppt.save(ppt_buffer)
-    ppt_buffer.seek(0)
-
-    excel_buffer = generate_excel(
-        data["nome"],
-        risk,
-        level,
-        driver_df,
-        actions_df,
-        action_plan_df,
-        explanations_df,
-        summary,
-        root_cause,
-        toolbox,
-        reduce_risk,
-        data
-    )
-
-    safe_nome = data["nome"].replace(" ", "_").replace("/", "_")
-
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        st.download_button(
-            label="📥 Scarica PowerPoint",
-            data=ppt_buffer,
-            file_name=f"HSE_Risk_Report_{safe_nome}.pptx",
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        selected_site = st.selectbox(
+            "Cantiere",
+            SITI,
+            index=SITI.index(
+                st.session_state.selected_site
+            ),
+            key="sidebar_site",
         )
 
-    with col_b:
-        st.download_button(
-            label="📥 Scarica Excel",
-            data=excel_buffer,
-            file_name=f"HSE_Risk_Report_{safe_nome}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        st.session_state.selected_site = selected_site
+
+        if st.button(
+            "Apri cantiere nel portale",
+            width="stretch",
+        ):
+            go_to("site")
+            st.rerun()
+
+        st.link_button(
+            "Apri cantiere su SharePoint",
+            sharepoint_folder_url(site=selected_site),
+            width="stretch",
         )
+
+        st.divider()
+
+        if st.button(
+            "← Esci dall'area",
+            width="stretch",
+        ):
+            st.session_state.role = None
+            st.session_state.page = "home"
+            st.rerun()
+
+
+# ============================================================
+# HOME
+# ============================================================
+
+def render_home() -> None:
+    render_header(
+        APP_NAME,
+        (
+            "Un unico punto di accesso per raggiungere, consultare "
+            "e archiviare la documentazione HSE dei cantieri."
+        ),
+    )
+
+    render_html(
+        """
+        <div class="success-banner">
+            Il portale indirizza gli utenti verso la cartella
+            SharePoint corretta. I documenti restano conservati
+            esclusivamente nell'archivio aziendale.
+        </div>
+        """
+    )
+
+    col1, col2 = st.columns(2, gap="large")
+
+    with col1:
+        render_html(
+            """
+            <div class="access-card">
+                <div class="access-icon">🏢</div>
+                <div class="access-title">Accesso Enel</div>
+                <div class="access-copy">
+                    Dashboard dei cantieri, ricerca guidata,
+                    consultazione delle categorie e accesso
+                    alle cartelle SharePoint.
+                </div>
+            </div>
+            """
+        )
+
+        if st.button(
+            "Entra nell'area Enel",
+            type="primary",
+            width="stretch",
+        ):
+            go_to("enel_dashboard", "enel")
+            st.rerun()
+
+    with col2:
+        render_html(
+            """
+            <div class="access-card">
+                <div class="access-icon">👷</div>
+                <div class="access-title">Accesso Imprese</div>
+                <div class="access-copy">
+                    Percorso guidato per selezionare il cantiere,
+                    scegliere la categoria e aprire la cartella
+                    corretta per il caricamento.
+                </div>
+            </div>
+            """
+        )
+
+        if st.button(
+            "Entra nell'area Imprese",
+            width="stretch",
+        ):
+            go_to("company_upload", "company")
+            st.rerun()
+
+
+# ============================================================
+# DASHBOARD ENEL
+# ============================================================
+
+def render_enel_dashboard() -> None:
+    render_header(
+        "Dashboard documentale",
+        (
+            "Accesso centralizzato all'archivio SharePoint, "
+            "ai cantieri e alle relative categorie documentali."
+        ),
+    )
+
+    columns = st.columns(4)
+
+    metrics = [
+        (
+            "Cantieri configurati",
+            len(SITI),
+            "Cartelle principali disponibili",
+        ),
+        (
+            "Categorie per cantiere",
+            len(CATEGORIE),
+            "Struttura documentale standard",
+        ),
+        (
+            "Archivio ufficiale",
+            "SharePoint",
+            "Conservazione aziendale",
+        ),
+        (
+            "Stato collegamento",
+            "Operativo",
+            "Apertura diretta delle cartelle",
+        ),
+    ]
+
+    for column, metric in zip(columns, metrics):
+        with column:
+            metric_card(*metric)
+
+    render_html(
+        '<div class="section-title">Accesso generale</div>'
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.link_button(
+            "Apri archivio generale SharePoint",
+            sharepoint_folder_url(),
+            type="primary",
+            width="stretch",
+        )
+
+    with col2:
+        if st.button(
+            "Apri ricerca guidata",
+            width="stretch",
+        ):
+            go_to("search")
+            st.rerun()
+
+    render_html(
+        '<div class="section-title">Cantieri</div>'
+    )
+
+    rows = [
+        SITI[index:index + 3]
+        for index in range(0, len(SITI), 3)
+    ]
+
+    for row in rows:
+        cards = st.columns(3)
+
+        for card, site in zip(cards, row):
+            with card:
+                render_html(
+                    f"""
+                    <div class="site-card">
+                        <div class="card-icon">🏗️</div>
+                        <div class="site-name">{safe(site)}</div>
+                        <div class="card-number">{len(CATEGORIE)}</div>
+                        <div class="card-caption">
+                            categorie documentali configurate
+                        </div>
+                    </div>
+                    """
+                )
+
+                if st.button(
+                    "Apri nel portale",
+                    key=f"portal_{site}",
+                    width="stretch",
+                ):
+                    st.session_state.selected_site = site
+                    go_to("site")
+                    st.rerun()
+
+                st.link_button(
+                    "Apri su SharePoint",
+                    sharepoint_folder_url(site=site),
+                    width="stretch",
+                )
+
+
+# ============================================================
+# PAGINA CANTIERE
+# ============================================================
+
+def render_site() -> None:
+    site = st.session_state.selected_site
+
+    render_header(
+        site,
+        (
+            "Consulta le categorie documentali e accedi "
+            "direttamente alle relative cartelle SharePoint."
+        ),
+    )
+
+    col1, col2 = st.columns([3, 1])
+
+    with col1:
+        site = st.selectbox(
+            "Seleziona il cantiere",
+            SITI,
+            index=SITI.index(site),
+            key="site_page_selector",
+        )
+
+        st.session_state.selected_site = site
+
+    with col2:
+        st.write("")
+        st.write("")
+
+        st.link_button(
+            "Apri cantiere su SharePoint",
+            sharepoint_folder_url(site=site),
+            type="primary",
+            width="stretch",
+        )
+
+    rows = [
+        CATEGORIE[index:index + 3]
+        for index in range(0, len(CATEGORIE), 3)
+    ]
+
+    for row in rows:
+        cards = st.columns(3)
+
+        for card, category in zip(cards, row):
+            with card:
+                render_html(
+                    f"""
+                    <div class="category-card">
+                        <div class="card-icon">
+                            {CATEGORY_ICONS[category]}
+                        </div>
+                        <div class="category-name">
+                            {safe(category)}
+                        </div>
+                        <div class="card-number">📁</div>
+                        <div class="card-caption">
+                            Cartella documentale SharePoint
+                        </div>
+                    </div>
+                    """
+                )
+
+                if st.button(
+                    "Seleziona categoria",
+                    key=f"select_{site}_{category}",
+                    width="stretch",
+                ):
+                    st.session_state.selected_category = category
+                    go_to("documents")
+                    st.rerun()
+
+                st.link_button(
+                    "Apri cartella",
+                    sharepoint_folder_url(
+                        site=site,
+                        category=category,
+                    ),
+                    width="stretch",
+                )
+
+
+# ============================================================
+# GESTIONE ARCHIVIO
+# ============================================================
+
+def render_documents() -> None:
+    render_header(
+        "Gestione archivio",
+        (
+            "Seleziona il cantiere e la categoria per raggiungere "
+            "la cartella documentale corretta."
+        ),
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        site = st.selectbox(
+            "Cantiere",
+            SITI,
+            index=SITI.index(
+                st.session_state.selected_site
+            ),
+            key="documents_site",
+        )
+
+    with col2:
+        category = st.selectbox(
+            "Categoria",
+            CATEGORIE,
+            index=CATEGORIE.index(
+                st.session_state.selected_category
+            ),
+            key="documents_category",
+        )
+
+    st.session_state.selected_site = site
+    st.session_state.selected_category = category
+
+    render_html(
+        f"""
+        <div class="panel">
+            <div class="category-name">
+                {CATEGORY_ICONS[category]} Destinazione selezionata
+            </div>
+            <div style="margin-top:0.8rem;">
+                <strong>Cantiere:</strong> {safe(site)}
+            </div>
+            <div style="margin-top:0.35rem;">
+                <strong>Categoria:</strong> {safe(category)}
+            </div>
+            <div class="muted" style="margin-top:0.8rem;">
+                Il pulsante apre direttamente la cartella
+                SharePoint corrispondente.
+            </div>
+        </div>
+        """
+    )
+
+    st.write("")
+
+    st.link_button(
+        "Apri la cartella documentale",
+        sharepoint_folder_url(
+            site=site,
+            category=category,
+        ),
+        type="primary",
+        width="stretch",
+    )
+
+
+# ============================================================
+# RICERCA
+# ============================================================
+
+def render_search() -> None:
+    render_header(
+        "Ricerca documenti",
+        (
+            "Individua il cantiere e la categoria prima "
+            "di aprire l'archivio SharePoint."
+        ),
+    )
+
+    query = st.text_input(
+        "Filtra cantieri e categorie",
+        placeholder=(
+            "Esempio: Udine, checklist, procedure, mezzi..."
+        ),
+    )
+
+    normalized_query = query.strip().lower()
+
+    matching_sites = [
+        site
+        for site in SITI
+        if not normalized_query
+        or normalized_query in site.lower()
+    ]
+
+    matching_categories = [
+        category
+        for category in CATEGORIE
+        if not normalized_query
+        or normalized_query in category.lower()
+    ]
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        render_html(
+            '<div class="section-title">Cantieri</div>'
+        )
+
+        for site in matching_sites:
+            st.link_button(
+                f"🏗️ {site}",
+                sharepoint_folder_url(site=site),
+                width="stretch",
+            )
+
+    with col2:
+        render_html(
+            '<div class="section-title">Categorie trovate</div>'
+        )
+
+        for category in matching_categories:
+            st.write(
+                f"{CATEGORY_ICONS[category]} **{category}**"
+            )
+
+    render_html(
+        '<div class="section-title">Ricerca mirata</div>'
+    )
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        selected_site = st.selectbox(
+            "Cantiere da consultare",
+            SITI,
+            key="search_site",
+        )
+
+    with col4:
+        selected_category = st.selectbox(
+            "Categoria da consultare",
+            CATEGORIE,
+            key="search_category",
+        )
+
+    st.link_button(
+        "Apri la cartella selezionata",
+        sharepoint_folder_url(
+            site=selected_site,
+            category=selected_category,
+        ),
+        type="primary",
+        width="stretch",
+    )
+
+
+# ============================================================
+# AREA IMPRESE
+# ============================================================
+
+def render_company_upload() -> None:
+    render_header(
+        "Caricamento documenti",
+        (
+            "Seleziona il cantiere e la categoria. "
+            "Il portale aprirà la cartella SharePoint corretta."
+        ),
+    )
+
+    render_html(
+        """
+        <div class="success-banner">
+            I file non vengono memorizzati su Streamlit.
+            Il caricamento avviene direttamente su SharePoint.
+        </div>
+        """
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        site = st.selectbox(
+            "1. Seleziona il cantiere",
+            SITI,
+            index=SITI.index(
+                st.session_state.selected_site
+            ),
+            key="company_upload_site",
+        )
+
+    with col2:
+        category = st.selectbox(
+            "2. Seleziona la categoria",
+            CATEGORIE,
+            index=CATEGORIE.index(
+                st.session_state.selected_category
+            ),
+            key="company_upload_category",
+        )
+
+    st.session_state.selected_site = site
+    st.session_state.selected_category = category
+
+    render_html(
+        '<div class="section-title">Procedura di caricamento</div>'
+    )
+
+    columns = st.columns(4)
+
+    steps = [
+        (
+            "01",
+            "Apri la cartella",
+            "Usa il pulsante presente in fondo alla pagina.",
+        ),
+        (
+            "02",
+            "Accedi con Microsoft",
+            "Utilizza il tuo account aziendale.",
+        ),
+        (
+            "03",
+            "Clicca Carica",
+            "In SharePoint scegli Carica e poi File.",
+        ),
+        (
+            "04",
+            "Seleziona i documenti",
+            "I file saranno conservati nella cartella scelta.",
+        ),
+    ]
+
+    for column, step in zip(columns, steps):
+        number, title, description = step
+
+        with column:
+            render_html(
+                f"""
+                <div class="process-step">
+                    <div class="process-number">{safe(number)}</div>
+                    <div class="process-title">{safe(title)}</div>
+                    <div class="process-copy">{safe(description)}</div>
+                </div>
+                """
+            )
+
+    render_html(
+        f"""
+        <div class="panel">
+            <div class="category-name">
+                Destinazione del caricamento
+            </div>
+            <div style="margin-top:0.8rem;">
+                <strong>Cantiere:</strong> {safe(site)}
+            </div>
+            <div style="margin-top:0.35rem;">
+                <strong>Categoria:</strong> {safe(category)}
+            </div>
+        </div>
+        """
+    )
+
+    st.write("")
+
+    st.link_button(
+        "Apri SharePoint e carica i documenti",
+        sharepoint_folder_url(
+            site=site,
+            category=category,
+        ),
+        type="primary",
+        width="stretch",
+    )
+
+
+def render_company_documents() -> None:
+    render_header(
+        "Consulta archivio",
+        (
+            "Accedi ai documenti già caricati selezionando "
+            "il cantiere e la categoria."
+        ),
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        site = st.selectbox(
+            "Cantiere",
+            SITI,
+            key="company_documents_site",
+        )
+
+    with col2:
+        category_options = [
+            "Tutte le categorie",
+            *CATEGORIE,
+        ]
+
+        category = st.selectbox(
+            "Categoria",
+            category_options,
+            key="company_documents_category",
+        )
+
+    if category == "Tutte le categorie":
+        target_url = sharepoint_folder_url(site=site)
+        destination = f"{site} / Tutte le categorie"
+    else:
+        target_url = sharepoint_folder_url(
+            site=site,
+            category=category,
+        )
+        destination = f"{site} / {category}"
+
+    render_html(
+        f"""
+        <div class="panel">
+            <div class="category-name">
+                Archivio selezionato
+            </div>
+            <div style="margin-top:0.8rem;">
+                {safe(destination)}
+            </div>
+        </div>
+        """
+    )
+
+    st.write("")
+
+    st.link_button(
+        "Apri i documenti su SharePoint",
+        target_url,
+        type="primary",
+        width="stretch",
+    )
+
+
+# ============================================================
+# AVVIO
+# ============================================================
+
+def main() -> None:
+    configure_page()
+    apply_styles()
+    initialize_state()
+    render_sidebar()
+
+    page = st.session_state.page
+
+    if page == "home":
+        render_home()
+
+    elif page == "enel_dashboard":
+        render_enel_dashboard()
+
+    elif page == "site":
+        render_site()
+
+    elif page == "documents":
+        render_documents()
+
+    elif page == "search":
+        render_search()
+
+    elif page == "company_upload":
+        render_company_upload()
+
+    elif page == "company_documents":
+        render_company_documents()
+
+    else:
+        st.session_state.page = "home"
+        st.session_state.role = None
+        st.rerun()
+
+    render_footer()
+
+
+if __name__ == "__main__":
+    main()

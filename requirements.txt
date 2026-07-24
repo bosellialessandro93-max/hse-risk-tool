@@ -1,5 +1,6 @@
 streamlit
 pandas
+altair
 python-pptx
 openpyxl
-openai
+Pillow

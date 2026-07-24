@@ -1,9 +1,12 @@
 from io import BytesIO
 from datetime import datetime
+from pathlib import Path
+import textwrap
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
 from pptx import Presentation
 from pptx.util import Inches
 
@@ -92,6 +95,44 @@ LINKS_AWARENESS_ACTIVITY = {
     "dpi": ["civili", "meccanici", "elettrici", "scavi"],
     "ordine e pulizia": ["civili", "meccanici"]
 }
+
+
+# La fase non genera più un malus diretto sul Risk Index.
+# Viene però utilizzata per verificare la coerenza delle
+# sensibilizzazioni con il momento operativo del cantiere.
+LINKS_PHASE_AWARENESS = {
+    "cantierizzazione": [
+        "scavi e sottoservizi",
+        "viabilità e mezzi",
+        "ordine e pulizia",
+        "toolbox generale"
+    ],
+    "costruzione": [
+        "lavori in quota",
+        "sollevamenti",
+        "dpi",
+        "ordine e pulizia",
+        "toolbox generale"
+    ],
+    "commissioning": [
+        "rischio elettrico",
+        "hot work / incendio",
+        "dpi",
+        "toolbox generale"
+    ],
+    "punch list": [
+        "rischio elettrico",
+        "lavori in quota",
+        "ordine e pulizia",
+        "dpi",
+        "toolbox generale"
+    ]
+}
+
+STOP_WORK_BONUS_PER_EVENT = 1.5
+STOP_WORK_BONUS_CAP = 6.0
+PHASE_AWARENESS_BONUS_PER_MATCH = 2
+PHASE_AWARENESS_BONUS_CAP = 6
 
 
 # =========================================================
@@ -367,17 +408,23 @@ def calculate_risk(data):
         )
 
     # -----------------------------------------------------
-    # 4. STOP WORK
+    # 4. STOP WORK - SOLO BONUS, CON IMPATTO LIMITATO
     # -----------------------------------------------------
-    stop_score = min(
-        data["stopworks"] * 10,
-        40
+    stop_work_bonus = min(
+        data["stopworks"] * STOP_WORK_BONUS_PER_EVENT,
+        STOP_WORK_BONUS_CAP
     )
 
     if data["stopworks"] > 0:
         explanations.append(
             f"{data['stopworks']} Stop Work registrati: "
-            f"+{stop_score} punti grezzi."
+            f"bonus cultura della sicurezza -{stop_work_bonus:.1f}. "
+            "Il beneficio è limitato per evitare che compensi "
+            "eccessivamente altri fattori di rischio."
+        )
+    else:
+        explanations.append(
+            "Nessuno Stop Work registrato: nessun bonus applicato."
         )
 
     # -----------------------------------------------------
@@ -562,31 +609,16 @@ def calculate_risk(data):
     # -----------------------------------------------------
     # 11. FASE DEL CANTIERE
     # -----------------------------------------------------
+    # La fase resta un dato operativo e viene utilizzata per
+    # valutare la coerenza delle sensibilizzazioni. Non genera
+    # più alcun malus diretto sul Risk Index.
     phase_score = 0
 
-    if data["fase"] == "commissioning":
-        phase_score = 18
-
-        explanations.append(
-            "Fase commissioning: "
-            "+18 punti per prove, energie e interferenze."
-        )
-
-    elif data["fase"] == "punch list":
-        phase_score = 10
-
-        explanations.append(
-            "Fase punch list: "
-            "+10 punti per attività residue."
-        )
-
-    elif data["fase"] == "cantierizzazione":
-        phase_score = 8
-
-        explanations.append(
-            "Fase cantierizzazione: "
-            "+8 punti per allestimenti e avvio attività."
-        )
+    explanations.append(
+        f"Fase '{data['fase']}': nessun impatto diretto "
+        "sul Risk Index; utilizzata per la verifica di coerenza "
+        "delle sensibilizzazioni."
+    )
 
     # -----------------------------------------------------
     # 12. BONUS SENSIBILIZZAZIONI
@@ -638,6 +670,37 @@ def calculate_risk(data):
                     "bonus -5."
                 )
 
+    phase_awareness_matches = [
+        awareness
+        for awareness in awareness_types
+        if awareness in LINKS_PHASE_AWARENESS.get(
+            data["fase"],
+            []
+        )
+    ]
+
+    phase_awareness_bonus = min(
+        len(phase_awareness_matches)
+        * PHASE_AWARENESS_BONUS_PER_MATCH,
+        PHASE_AWARENESS_BONUS_CAP
+    )
+
+    if phase_awareness_bonus > 0:
+        awareness_bonus += phase_awareness_bonus
+
+        explanations.append(
+            f"Sensibilizzazioni coerenti con la fase "
+            f"'{data['fase']}': "
+            f"{', '.join(phase_awareness_matches)}. "
+            f"Bonus aggiuntivo -{phase_awareness_bonus}."
+        )
+    else:
+        explanations.append(
+            f"Nessuna sensibilizzazione specificamente coerente "
+            f"con la fase '{data['fase']}': "
+            "nessun bonus di coerenza fase."
+        )
+
     awareness_bonus = min(
         awareness_bonus,
         35
@@ -651,14 +714,13 @@ def calculate_risk(data):
         + crit_score * 0.15
         + activity_score * 0.18
         + complexity_score * 0.10
-        + stop_score * 0.10
         + interference_score * 0.12
         + detection_penalty
         + inspection_ratio_adjustment
         + correlation_penalty
-        + phase_score
         + hse_coverage_adjustment
         - awareness_bonus
+        - stop_work_bonus
     )
 
     risk = max(
@@ -701,8 +763,8 @@ def calculate_risk(data):
     ))
 
     details.append((
-        "Stop Work",
-        round(stop_score * 0.10, 1)
+        "Bonus Stop Work",
+        round(-stop_work_bonus, 1)
     ))
 
     details.append((
@@ -721,11 +783,6 @@ def calculate_risk(data):
     ))
 
     details.append((
-        "Fase",
-        round(phase_score, 1)
-    ))
-
-    details.append((
         "Bonus sensibilizzazioni",
         round(-awareness_bonus, 1)
     ))
@@ -736,7 +793,11 @@ def calculate_risk(data):
         "activity_criticality_factor": activity_criticality_factor,
         "activity_count_factor": activity_count_factor,
         "hse_coverage_adjustment": hse_coverage_adjustment,
-        "hse_coverage_status": hse_coverage_status
+        "hse_coverage_status": hse_coverage_status,
+        "stop_work_bonus": round(stop_work_bonus, 1),
+        "phase_direct_impact": 0,
+        "phase_awareness_matches": phase_awareness_matches,
+        "phase_awareness_bonus": phase_awareness_bonus
     }
 
     return (
@@ -1670,6 +1731,23 @@ Azioni prioritarie:
         )
 
     if (
+        "bonus stop" in query
+        or "stop work" in query
+        or "stopwork" in query
+    ):
+        return f"""
+Sono stati registrati **{data['stopworks']} Stop Work**.
+
+Nel modello gli Stop Work sono considerati esclusivamente
+come un segnale positivo di cultura della sicurezza:
+il bonus applicato è **-{technical_data['stop_work_bonus']} punti**.
+
+Il beneficio è volutamente limitato a un massimo di
+**-{STOP_WORK_BONUS_CAP} punti**, così non può compensare
+NC, criticità o interferenze rilevanti.
+"""
+
+    if (
         "fermare" in query
         or "stop" in query
     ):
@@ -1813,6 +1891,357 @@ def create_driver_chart(driver_df):
     ).properties(
         height=420
     )
+
+
+
+# =========================================================
+# INFOGRAFICA DINAMICA PER EXPORT
+# =========================================================
+def get_template_path():
+    """
+    Cerca il template nella cartella assets del repository.
+    """
+    candidates = [
+        Path("assets") / "hse_output_template.png",
+        Path(__file__).resolve().parent / "assets" / "hse_output_template.png"
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def get_font(size, bold=False):
+    """
+    Usa font comuni disponibili nei sistemi Linux di Streamlit Cloud.
+    In assenza del font richiesto utilizza il font predefinito Pillow.
+    """
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
+        if bold
+        else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"
+    ]
+
+    for font_path in candidates:
+        if Path(font_path).exists():
+            return ImageFont.truetype(font_path, size=size)
+
+    return ImageFont.load_default()
+
+
+def plain_text(value):
+    return (
+        str(value)
+        .replace("**", "")
+        .replace("###", "")
+        .replace("##", "")
+        .replace("#", "")
+        .strip()
+    )
+
+
+def wrap_text_pixels(draw, text, font, max_width, max_lines=None):
+    """
+    Va a capo in base alla larghezza reale in pixel.
+    """
+    paragraphs = plain_text(text).splitlines()
+    lines = []
+
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+
+        if not paragraph:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+
+        words = paragraph.split()
+        current = ""
+
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            bbox = draw.textbbox((0, 0), candidate, font=font)
+
+            if bbox[2] - bbox[0] <= max_width:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+
+                if max_lines and len(lines) >= max_lines:
+                    break
+
+        if current and (not max_lines or len(lines) < max_lines):
+            lines.append(current)
+
+        if max_lines and len(lines) >= max_lines:
+            break
+
+    if max_lines and len(lines) > max_lines:
+        lines = lines[:max_lines]
+
+    if max_lines and len(lines) == max_lines:
+        last = lines[-1]
+        if not last.endswith("…"):
+            lines[-1] = last.rstrip(".,;: ") + "…"
+
+    return lines
+
+
+def draw_panel(draw, box, outline=(30, 165, 255), fill=(3, 14, 45, 225)):
+    draw.rounded_rectangle(
+        box,
+        radius=18,
+        fill=fill,
+        outline=outline,
+        width=3
+    )
+
+
+def draw_wrapped_text(
+    draw,
+    text,
+    box,
+    font,
+    fill=(225, 239, 255),
+    spacing=5,
+    max_lines=None
+):
+    x1, y1, x2, y2 = box
+    lines = wrap_text_pixels(
+        draw,
+        text,
+        font,
+        max_width=x2 - x1,
+        max_lines=max_lines
+    )
+
+    y = y1
+    line_height = font.getbbox("Ag")[3] - font.getbbox("Ag")[1] + spacing
+
+    for line in lines:
+        if y + line_height > y2:
+            break
+
+        draw.text(
+            (x1, y),
+            line,
+            font=font,
+            fill=fill
+        )
+        y += line_height
+
+
+def generate_export_infographic(
+    data,
+    risk,
+    level,
+    driver_df,
+    action_plan_df,
+    summary,
+    root_cause,
+    technical_data
+):
+    template_path = get_template_path()
+
+    if template_path is None:
+        return None
+
+    image = Image.open(template_path).convert("RGBA")
+    width, height = image.size
+
+    # Overlay leggero per migliorare la leggibilità dei dati dinamici.
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+
+    # Fascia risultati nella parte centrale/inferiore.
+    panel_box = (
+        int(width * 0.12),
+        int(height * 0.31),
+        int(width * 0.88),
+        int(height * 0.79)
+    )
+
+    draw_panel(
+        overlay_draw,
+        panel_box,
+        fill=(2, 10, 35, 238)
+    )
+
+    image = Image.alpha_composite(image, overlay)
+    draw = ImageDraw.Draw(image)
+
+    title_font = get_font(max(22, int(width * 0.026)), bold=True)
+    risk_font = get_font(max(54, int(width * 0.075)), bold=True)
+    heading_font = get_font(max(17, int(width * 0.018)), bold=True)
+    body_font = get_font(max(13, int(width * 0.0135)))
+    small_font = get_font(max(11, int(width * 0.0115)))
+
+    x1, y1, x2, y2 = panel_box
+    pad = int(width * 0.025)
+
+    draw.text(
+        (x1 + pad, y1 + pad),
+        f"{data['nome']} · {datetime.now().strftime('%d/%m/%Y')}",
+        font=title_font,
+        fill=(67, 190, 255)
+    )
+
+    # Risk Index
+    risk_x = x1 + pad
+    risk_y = y1 + int(height * 0.07)
+
+    draw.text(
+        (risk_x, risk_y),
+        f"{round(risk)}",
+        font=risk_font,
+        fill=(255, 255, 255)
+    )
+
+    draw.text(
+        (risk_x, risk_y + int(height * 0.085)),
+        f"RISK INDEX / 100 · {level.upper()}",
+        font=heading_font,
+        fill=(67, 190, 255)
+    )
+
+    draw.text(
+        (risk_x, risk_y + int(height * 0.125)),
+        (
+            f"Fase: {data['fase']}  |  "
+            f"Interferenza: {data['interference_level']}/10  |  "
+            f"Detection: {technical_data['nc_detection_ratio']}"
+        ),
+        font=small_font,
+        fill=(205, 225, 245)
+    )
+
+    # Driver principali
+    positive_drivers = (
+        driver_df[driver_df["Valore"] > 0]
+        .sort_values("Valore", ascending=False)
+        .head(4)
+    )
+
+    driver_text = "\n".join(
+        f"• {row['Driver']}: +{float(row['Valore']):.1f}"
+        for _, row in positive_drivers.iterrows()
+    ) or "• Nessun driver negativo dominante"
+
+    drivers_box = (
+        x1 + int(width * 0.27),
+        y1 + int(height * 0.075),
+        x1 + int(width * 0.49),
+        y1 + int(height * 0.225)
+    )
+
+    draw.text(
+        (drivers_box[0], drivers_box[1] - int(height * 0.03)),
+        "DRIVER PRINCIPALI",
+        font=heading_font,
+        fill=(67, 190, 255)
+    )
+
+    draw_wrapped_text(
+        draw,
+        driver_text,
+        drivers_box,
+        body_font,
+        max_lines=7
+    )
+
+    # Action plan
+    actions = action_plan_df.head(4)["Azione"].tolist()
+    action_text = "\n".join(
+        f"{index + 1}. {action}"
+        for index, action in enumerate(actions)
+    )
+
+    action_box = (
+        x1 + int(width * 0.51),
+        y1 + int(height * 0.075),
+        x2 - pad,
+        y1 + int(height * 0.225)
+    )
+
+    draw.text(
+        (action_box[0], action_box[1] - int(height * 0.03)),
+        "AZIONI PRIORITARIE",
+        font=heading_font,
+        fill=(67, 190, 255)
+    )
+
+    draw_wrapped_text(
+        draw,
+        action_text,
+        action_box,
+        body_font,
+        max_lines=7
+    )
+
+    # Summary e Root Cause in basso
+    lower_top = y1 + int(height * 0.25)
+    middle_x = x1 + int((x2 - x1) * 0.5)
+
+    summary_box = (
+        x1 + pad,
+        lower_top + int(height * 0.035),
+        middle_x - int(width * 0.018),
+        y2 - pad
+    )
+
+    root_box = (
+        middle_x + int(width * 0.018),
+        lower_top + int(height * 0.035),
+        x2 - pad,
+        y2 - pad
+    )
+
+    draw.text(
+        (summary_box[0], lower_top),
+        "REPORT RIASSUNTIVO",
+        font=heading_font,
+        fill=(67, 190, 255)
+    )
+
+    draw_wrapped_text(
+        draw,
+        summary,
+        summary_box,
+        small_font,
+        max_lines=13
+    )
+
+    draw.text(
+        (root_box[0], lower_top),
+        "ROOT CAUSE",
+        font=heading_font,
+        fill=(67, 190, 255)
+    )
+
+    draw_wrapped_text(
+        draw,
+        root_cause,
+        root_box,
+        small_font,
+        max_lines=13
+    )
+
+    output = BytesIO()
+    image.convert("RGB").save(
+        output,
+        format="PNG",
+        optimize=True
+    )
+    output.seek(0)
+
+    return output
 
 
 # =========================================================
@@ -2211,7 +2640,11 @@ with st.sidebar:
 
     nome = st.text_input(
         "Nome cantiere",
-        value="Cantiere Demo"
+        value="Cantiere Demo",
+        help=(
+            "Identifica il sito o il progetto. Il nome viene riportato "
+            "nei report PowerPoint, Excel e nell'infografica PNG."
+        )
     )
 
     fase = st.selectbox(
@@ -2221,7 +2654,12 @@ with st.sidebar:
             "costruzione",
             "commissioning",
             "punch list"
-        ]
+        ],
+        help=(
+            "La fase non aumenta direttamente il Risk Index. "
+            "Serve per contestualizzare gli output e premiare "
+            "le sensibilizzazioni coerenti con il momento operativo."
+        )
     )
 
     st.divider()
@@ -2235,14 +2673,23 @@ with st.sidebar:
         "Numero ispezioni",
         min_value=0,
         max_value=1000,
-        value=10
+        value=10,
+        help=(
+            "Numero di ispezioni HSE eseguite nel periodo analizzato. "
+            "Influisce sull'indice di detection e sul rapporto ispezioni/NC."
+        )
     )
 
     num_nc = st.number_input(
         "Numero totale NC",
         min_value=0,
         max_value=300,
-        value=0
+        value=0,
+        help=(
+            "Numero complessivo di non conformità rilevate. "
+            "Le NC dettagliate ricevono un peso per tema e gravità; "
+            "quelle non dettagliate ricevono un peso prudenziale medio."
+        )
     )
 
     nc_items = []
@@ -2251,7 +2698,11 @@ with st.sidebar:
         "Quante NC vuoi dettagliare?",
         min_value=0,
         max_value=20,
-        value=min(num_nc, 3)
+        value=min(num_nc, 3),
+        help=(
+            "Permette di specificare tema e gravità delle NC principali. "
+            "Il numero non può superare il totale delle NC inserite."
+        )
     )
 
     for index in range(nc_count_detail):
@@ -2261,7 +2712,12 @@ with st.sidebar:
             theme = st.selectbox(
                 f"Tema NC {index + 1}",
                 list(NC_THEME_WEIGHTS.keys()),
-                key=f"nc_theme_{index}"
+                key=f"nc_theme_{index}",
+                help=(
+                    "Il tema determina il peso tecnico della NC. "
+                    "Temi ad alto potenziale, come elettrico o spazi "
+                    "confinati, hanno un impatto maggiore."
+                )
             )
 
         with col2:
@@ -2272,7 +2728,11 @@ with st.sidebar:
                     "media",
                     "alta"
                 ],
-                key=f"nc_severity_{index}"
+                key=f"nc_severity_{index}",
+                help=(
+                    "La gravità integra il peso del tema: bassa +3, "
+                    "media +8, alta +16 punti grezzi."
+                )
             )
 
         nc_items.append({
@@ -2291,28 +2751,45 @@ with st.sidebar:
         "Stop Work",
         min_value=0,
         max_value=100,
-        value=0
+        value=0,
+        help=(
+            "Gli Stop Work sono considerati esclusivamente come bonus "
+            "di cultura della sicurezza: -1,5 punti ciascuno, con un "
+            "massimo di -6 punti complessivi."
+        )
     )
 
     crit_open = st.number_input(
         "Criticità aperte",
         min_value=0,
         max_value=200,
-        value=0
+        value=0,
+        help=(
+            "Criticità ancora da risolvere. Hanno il peso maggiore "
+            "nel driver criticità perché rappresentano esposizioni attive."
+        )
     )
 
     crit_ontime = st.number_input(
         "Criticità risolte in tempo",
         min_value=0,
         max_value=200,
-        value=0
+        value=0,
+        help=(
+            "Criticità chiuse entro la scadenza. Mantengono un peso "
+            "residuo limitato per rappresentare l'evento rilevato."
+        )
     )
 
     crit_late = st.number_input(
         "Criticità risolte in ritardo",
         min_value=0,
         max_value=200,
-        value=0
+        value=0,
+        help=(
+            "Criticità chiuse oltre la scadenza. Generano un malus "
+            "per evidenziare debolezze nel follow-up."
+        )
     )
 
     st.divider()
@@ -2326,14 +2803,22 @@ with st.sidebar:
         "Numero appaltatori",
         min_value=0,
         max_value=100,
-        value=1
+        value=1,
+        help=(
+            "Numero di imprese appaltatrici presenti. Contribuisce "
+            "alla complessità organizzativa e al calcolo della copertura HSE."
+        )
     )
 
     sub = st.number_input(
         "Numero subappaltatori",
         min_value=0,
         max_value=100,
-        value=0
+        value=0,
+        help=(
+            "Numero di imprese subappaltatrici presenti. Ha un peso "
+            "maggiore degli appaltatori nella complessità organizzativa."
+        )
     )
 
     company_hse = st.number_input(
@@ -2359,7 +2844,12 @@ with st.sidebar:
     activities = st.multiselect(
         "Tipologie attività presenti",
         list(ACTIVITY_WEIGHTS.keys()),
-        default=["civili"]
+        default=["civili"],
+        help=(
+            "Seleziona tutte le lavorazioni effettivamente in corso. "
+            "Tipologia, numero e contemporaneità incidono sul rischio "
+            "e sulle correlazioni con NC e sensibilizzazioni."
+        )
     )
 
     interference_level = st.slider(
@@ -2396,12 +2886,20 @@ with st.sidebar:
         "Numero sensibilizzazioni effettuate",
         min_value=0,
         max_value=1000,
-        value=0
+        value=0,
+        help=(
+            "Numero complessivo di toolbox o sensibilizzazioni eseguite "
+            "nel periodo. La continuità genera un bonus limitato."
+        )
     )
 
     awareness_types = st.multiselect(
         "Tipologie sensibilizzazioni effettuate",
-        list(AWARENESS_BONUS.keys())
+        list(AWARENESS_BONUS.keys()),
+        help=(
+            "La tipologia determina il bonus e permette di verificare "
+            "la coerenza con le attività presenti e con la fase del cantiere."
+        )
     )
 
     st.divider()
@@ -2693,6 +3191,27 @@ with tab6:
                 technical_data[
                     "hse_coverage_status"
                 ]
+        },
+        {
+            "Indicatore": "Bonus Stop Work",
+            "Valore": -technical_data["stop_work_bonus"],
+            "Descrizione":
+                "Solo bonus, con impatto massimo limitato a -6"
+        },
+        {
+            "Indicatore": "Impatto diretto fase",
+            "Valore": technical_data["phase_direct_impact"],
+            "Descrizione":
+                "La fase non incide direttamente sul Risk Index"
+        },
+        {
+            "Indicatore": "Bonus coerenza fase/sensibilizzazioni",
+            "Valore": -technical_data["phase_awareness_bonus"],
+            "Descrizione": (
+                ", ".join(technical_data["phase_awareness_matches"])
+                if technical_data["phase_awareness_matches"]
+                else "Nessuna corrispondenza"
+            )
         }
     ])
 
@@ -2747,6 +3266,30 @@ with tab8:
         "Download report"
     )
 
+    infographic_buffer = generate_export_infographic(
+        data,
+        risk,
+        level,
+        driver_df,
+        action_plan_df,
+        summary,
+        root_cause,
+        technical_data
+    )
+
+    if infographic_buffer is not None:
+        st.markdown("### Infografica dinamica del calcolo")
+        st.image(
+            infographic_buffer,
+            use_container_width=True
+        )
+        infographic_buffer.seek(0)
+    else:
+        st.warning(
+            "Template infografica non trovato. Carica il file "
+            "`assets/hse_output_template.png` nel repository GitHub."
+        )
+
     ppt = generate_ppt(
         data,
         risk,
@@ -2782,7 +3325,7 @@ with tab8:
         data["nome"]
     )
 
-    col_a, col_b = st.columns(2)
+    col_a, col_b, col_c = st.columns(3)
 
     with col_a:
         st.download_button(

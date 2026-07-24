@@ -1,14 +1,15 @@
 from io import BytesIO
 from datetime import datetime
-from pathlib import Path
-import textwrap
 
 import altair as alt
 import pandas as pd
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
 from pptx import Presentation
 from pptx.util import Inches
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+from docx.shared import Pt, Inches as DocxInches
 
 
 # =========================================================
@@ -1126,142 +1127,127 @@ def local_root_cause(
     data,
     risk,
     level,
-    technical_data
+    technical_data,
+    driver_df=None
 ):
-    nc_themes = [
-        item["theme"]
-        for item in data["nc_items"]
-    ]
+    categories = {
+        "Non conformità": [],
+        "Attività": [],
+        "Interferenze": [],
+        "Organizzazione": [],
+        "Controlli": [],
+        "Cultura HSE": []
+    }
 
-    high_nc = [
-        item
-        for item in data["nc_items"]
-        if item["severity"] == "alta"
-    ]
+    high_nc = [item for item in data["nc_items"] if item["severity"] == "alta"]
+    nc_themes = [item["theme"] for item in data["nc_items"]]
 
-    causes = []
-
-    if high_nc:
-        causes.append(
-            "presenza di NC ad alta gravità"
+    if data["num_nc"] > 0:
+        categories["Non conformità"].append(
+            f"Sono presenti {data['num_nc']} NC, di cui {len(high_nc)} ad alta gravità."
         )
+    else:
+        categories["Non conformità"].append("Non risultano NC registrate nel periodo analizzato.")
 
     if technical_data["nc_detection_ratio"] >= 0.5:
-        causes.append(
-            "indice di detection significativo, con frequente "
-            "rilevazione di NC durante le ispezioni"
+        categories["Non conformità"].append(
+            f"L'indice di detection è significativo ({technical_data['nc_detection_ratio']} NC/ispezione)."
         )
 
-    if data["interference_level"] >= 6:
-        causes.append(
-            "livello elevato di interferenza tra le attività"
+    if data["activities"]:
+        categories["Attività"].append(
+            "Attività presenti: " + ", ".join(data["activities"]) + "."
         )
-
     if len(data["activities"]) >= 3:
-        causes.append(
-            "presenza contemporanea di più tipologie di lavorazione"
+        categories["Attività"].append(
+            "La contemporaneità di almeno tre tipologie di lavoro aumenta la complessità operativa."
         )
 
-    if data["company_hse"] < data["app"]:
-        causes.append(
-            "copertura HSE inferiore al numero degli appaltatori"
+    categories["Interferenze"].append(
+        f"Il livello dichiarato è {data['interference_level']}/10, con impatto tecnico pari a {technical_data['interference_score']} punti grezzi."
+    )
+    if data["interference_level"] >= 6:
+        categories["Interferenze"].append(
+            "È necessario rafforzare la separazione spaziale o temporale e il coordinamento giornaliero."
+        )
+
+    categories["Organizzazione"].append(
+        f"Sono presenti {data['app']} appaltatori, {data['sub']} subappaltatori e {data['company_hse']} HSE delle imprese."
+    )
+    categories["Organizzazione"].append(
+        f"Valutazione della copertura HSE: {technical_data['hse_coverage_status']}."
+    )
+    if data["sub"] >= 5:
+        categories["Organizzazione"].append(
+            "L'elevato numero di subappaltatori richiede una governance più strutturata."
         )
 
     if data["crit_open"] > 0:
-        causes.append(
-            "criticità ancora aperte"
+        categories["Controlli"].append(
+            f"Sono ancora aperte {data['crit_open']} criticità."
         )
-
     if data["crit_late"] > 0:
-        causes.append(
-            "ritardi nella chiusura delle criticità"
+        categories["Controlli"].append(
+            f"Sono state chiuse in ritardo {data['crit_late']} criticità, segnale di follow-up da rafforzare."
+        )
+    if data["inspections"] == 0:
+        categories["Controlli"].append("Non risultano ispezioni registrate.")
+    else:
+        categories["Controlli"].append(f"Sono state registrate {data['inspections']} ispezioni HSE.")
+
+    if data["awareness_count"] > 0:
+        categories["Cultura HSE"].append(
+            f"Sono state eseguite {data['awareness_count']} sensibilizzazioni."
+        )
+    else:
+        categories["Cultura HSE"].append(
+            "Non risultano sensibilizzazioni registrate: manca un elemento preventivo rilevante."
+        )
+    if data["stopworks"] > 0:
+        categories["Cultura HSE"].append(
+            f"Sono stati registrati {data['stopworks']} Stop Work, considerati un segnale positivo di partecipazione."
         )
 
-    if data["sub"] >= 5:
-        causes.append(
-            "elevata complessità organizzativa dovuta ai subappaltatori"
-        )
+    contribution_map = {
+        "Non conformità": ["NC", "Indice di detection", "Correlazioni critiche"],
+        "Attività": ["Attività"],
+        "Interferenze": ["Interferenza attività"],
+        "Organizzazione": ["Complessità organizzativa", "Copertura HSE imprese"],
+        "Controlli": ["Criticità", "Bonus/Malus rapporto ispezioni"],
+        "Cultura HSE": ["Bonus Stop Work", "Bonus sensibilizzazioni"],
+    }
 
-    if data["awareness_count"] == 0:
-        causes.append(
-            "assenza di sensibilizzazioni registrate"
-        )
+    contributions = {}
+    if driver_df is not None:
+        for category, drivers in contribution_map.items():
+            value = driver_df[driver_df["Driver"].isin(drivers)]["Valore"].sum()
+            contributions[category] = round(float(value), 1)
+    else:
+        contributions = {category: 0.0 for category in categories}
 
-    if not causes:
-        causes.append(
-            "nessuna causa dominante; il rischio deriva "
-            "dalla combinazione dei fattori inseriti"
-        )
+    positive = {key: max(value, 0) for key, value in contributions.items()}
+    total_positive = sum(positive.values())
+    percentages = {
+        key: round((value / total_positive) * 100) if total_positive > 0 else 0
+        for key, value in positive.items()
+    }
 
-    controls = []
+    blocks = []
+    for category, items in categories.items():
+        impact = contributions.get(category, 0)
+        percentage = percentages.get(category, 0)
+        blocks.append(f"### {category}\n\n**Contributo netto:** {impact:+.1f} punti | **Quota dei driver negativi:** {percentage}%")
+        blocks.extend(f"- {item}" for item in items)
 
-    if "elettrico" in nc_themes or "elettrici" in data["activities"]:
-        controls.append(
-            "LOTO, sezionamenti, autorizzazioni e competenze elettriche"
-        )
-
-    if "scavi" in nc_themes or "scavi" in data["activities"]:
-        controls.append(
-            "sottoservizi, fronti di scavo, accessi e delimitazioni"
-        )
-
-    if "quota" in nc_themes or "lavori in quota" in data["activities"]:
-        controls.append(
-            "protezioni collettive, ancoraggi, PLE e DPI anticaduta"
-        )
-
-    if "sollevamenti" in data["activities"]:
-        controls.append(
-            "piano di sollevamento, portate e segregazione"
-        )
-
-    if data["interference_level"] >= 6:
-        controls.append(
-            "matrice interferenziale, cronoprogramma e briefing giornaliero"
-        )
-
-    if data["company_hse"] < data["app"]:
-        controls.append(
-            "distribuzione e adeguatezza del presidio HSE delle imprese"
-        )
-
-    if not controls:
-        controls.append(
-            "controlli operativi standard e briefing pre-job"
-        )
-
-    causes_text = "\n".join(
-        f"- {cause}"
-        for cause in causes
+    dominant = max(positive, key=positive.get) if positive else "nessuna categoria"
+    conclusion = (
+        f"### Conclusione complessiva\n\nIl Risk Index è **{round(risk)}/100 ({level})**. "
+        f"La categoria che contribuisce maggiormente ai driver negativi è **{dominant}**. "
+        "Le priorità devono essere definite sulla base dei contributi più elevati, senza trascurare "
+        "eventuali NC ad alta gravità o condizioni non controllate anche quando il loro peso numerico è limitato."
     )
 
-    controls_text = "\n".join(
-        f"- {control}"
-        for control in controls
-    )
-
-    return f"""
-### Cause probabili
-
-{causes_text}
-
-### Debolezze organizzative possibili
-
-- Pianificazione non pienamente allineata ai rischi reali.
-- Coordinamento delle interferenze da rafforzare.
-- Follow-up delle criticità da rendere più efficace.
-- Presidio HSE da verificare rispetto al numero delle imprese.
-
-### Controlli da verificare
-
-{controls_text}
-
-### Conclusione operativa
-
-Il livello **{level}** richiede un piano proporzionato al rischio,
-con priorità alle NC ad alta gravità, alle interferenze,
-alla copertura HSE e alle criticità ancora aperte.
-"""
+    return "\n\n".join(blocks + [conclusion])
 
 
 # =========================================================
@@ -1895,353 +1881,306 @@ def create_driver_chart(driver_df):
 
 
 # =========================================================
-# INFOGRAFICA DINAMICA PER EXPORT
+# HSE SCORECARD
 # =========================================================
-def get_template_path():
-    """
-    Cerca il template nella cartella assets del repository.
-    """
-    candidates = [
-        Path("assets") / "hse_output_template.png",
-        Path(__file__).resolve().parent / "assets" / "hse_output_template.png"
+def clamp(value, minimum=0.0, maximum=10.0):
+    return max(minimum, min(maximum, value))
+
+
+def generate_hse_scorecard(data, risk, technical_data):
+    """Genera una scorecard sintetica su scala 0-10."""
+    organization = 10.0
+    organization -= min(data["sub"] * 0.35, 2.0)
+    organization -= max(technical_data["hse_coverage_adjustment"], 0) / 6
+    organization += min(max(-technical_data["hse_coverage_adjustment"], 0) / 8, 1.0)
+
+    planning = 10.0
+    planning -= max(data["interference_level"] - 3, 0) * 0.55
+    planning -= 1.2 if len(data["activities"]) >= 3 else 0
+    planning -= 0.8 if data["crit_late"] > 0 else 0
+
+    operational = 10.0
+    operational -= min(technical_data["nc_detection_ratio"] * 3.2, 4.0)
+    operational -= min(data["crit_open"] * 0.45, 2.5)
+    operational -= min(sum(1 for item in data["nc_items"] if item["severity"] == "alta") * 0.8, 2.0)
+
+    culture = 6.0
+    culture += min(data["awareness_count"] * 0.25, 2.0)
+    culture += min(data["stopworks"] * 0.30, 1.5)
+    culture += min(len(data["awareness_types"]) * 0.18, 0.8)
+    culture -= 1.0 if data["awareness_count"] == 0 else 0
+
+    coordination = 10.0
+    coordination -= max(data["interference_level"] - 2, 0) * 0.55
+    coordination -= min(max(len(data["activities"]) - 2, 0) * 0.45, 1.8)
+    coordination -= 0.8 if data["sub"] >= 5 else 0
+
+    rows = [
+        ("Organizzazione", organization, "Adeguatezza della struttura, complessità imprese e copertura HSE."),
+        ("Pianificazione", planning, "Programmazione delle attività, gestione delle interferenze e puntualità del follow-up."),
+        ("Controllo operativo", operational, "Esito dei controlli, frequenza delle NC e criticità ancora aperte."),
+        ("Cultura HSE", culture, "Sensibilizzazioni, partecipazione e utilizzo responsabile dello Stop Work."),
+        ("Coordinamento", coordination, "Gestione della contemporaneità, delle imprese e delle lavorazioni interferenti."),
     ]
 
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    return None
-
-
-def get_font(size, bold=False):
-    """
-    Usa font comuni disponibili nei sistemi Linux di Streamlit Cloud.
-    In assenza del font richiesto utilizza il font predefinito Pillow.
-    """
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        if bold
-        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
-        if bold
-        else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"
-    ]
-
-    for font_path in candidates:
-        if Path(font_path).exists():
-            return ImageFont.truetype(font_path, size=size)
-
-    return ImageFont.load_default()
-
-
-def plain_text(value):
-    return (
-        str(value)
-        .replace("**", "")
-        .replace("###", "")
-        .replace("##", "")
-        .replace("#", "")
-        .strip()
+    scorecard_df = pd.DataFrame(rows, columns=["Area", "Punteggio", "Motivazione"])
+    scorecard_df["Punteggio"] = scorecard_df["Punteggio"].apply(lambda value: round(clamp(value), 1))
+    scorecard_df["Stelle"] = scorecard_df["Punteggio"].apply(
+        lambda value: "★" * max(1, min(5, round(value / 2))) + "☆" * (5 - max(1, min(5, round(value / 2))))
     )
+    overall = round(scorecard_df["Punteggio"].mean(), 1)
+    return scorecard_df, overall
 
 
-def wrap_text_pixels(draw, text, font, max_width, max_lines=None):
-    """
-    Va a capo in base alla larghezza reale in pixel.
-    """
-    paragraphs = plain_text(text).splitlines()
-    lines = []
+# =========================================================
+# HSE TOOLKIT - CHECKLIST WORD
+# =========================================================
+CHECKLIST_LIBRARY = {
+    "Controlli generali pre-attività": [
+        "L'attività è inserita nel programma lavori / sinottico aggiornato?",
+        "È stato eseguito il coordinamento con le imprese coinvolte e interferenti?",
+        "Sono stati individuati il preposto e i referenti operativi dell'attività?",
+        "La documentazione operativa è disponibile, aggiornata e coerente con l'attività?",
+        "Sono state verificate formazione, informazione, addestramento e idoneità dei lavoratori?",
+        "Sono disponibili attrezzature, mezzi e DPI idonei e verificati?",
+        "L'area di lavoro è stata delimitata, segnalata e resa accessibile in sicurezza?",
+        "Sono state valutate le condizioni ambientali e meteorologiche?",
+        "Sono state definite le modalità di comunicazione e gestione delle emergenze?",
+        "È stato eseguito il briefing / pre-job check prima dell'avvio?",
+    ],
+    "Sollevamenti": [
+        "È stato predisposto e condiviso il piano di sollevamento?",
+        "Sono stati verificati peso, baricentro e punti di presa del carico?",
+        "La gru o l'apparecchio di sollevamento è idoneo e correttamente posizionato?",
+        "Sono disponibili verifiche, controlli e documentazione dell'attrezzatura?",
+        "Gruista, imbracatore e segnalatore possiedono formazione e abilitazioni richieste?",
+        "Gli accessori di sollevamento sono identificati, integri e adeguati alla portata?",
+        "L'area di manovra e la zona sottostante sono segregate?",
+        "Sono state verificate interferenze con linee elettriche, strutture e altre attività?",
+        "Sono definite modalità di comunicazione univoche tra gli operatori?",
+        "Sono rispettati i limiti meteo e di vento previsti?",
+    ],
+    "Lavori elettrici": [
+        "Sono definiti ruoli, responsabilità e autorizzazioni per il lavoro elettrico?",
+        "Sono verificate le competenze PES, PAV, PEI o equivalenti richieste?",
+        "È disponibile il permesso / piano di lavoro applicabile?",
+        "Sono state eseguite sezionamento, blocco, identificazione e prevenzione delle richiusure?",
+        "È stata verificata l'assenza di tensione con strumento idoneo?",
+        "Sono state applicate eventuali terre e cortocircuiti previste?",
+        "Sono definite e rispettate le distanze di sicurezza dalle parti attive?",
+        "DPI, attrezzi isolati e strumenti sono idonei e verificati?",
+        "Sono gestite le interferenze con impianti o stalli adiacenti in esercizio?",
+        "Sono definite le procedure di emergenza e soccorso elettrico?",
+    ],
+    "Scavi": [
+        "Sono stati individuati e tracciati i sottoservizi presenti?",
+        "È disponibile l'autorizzazione allo scavo e la documentazione prevista?",
+        "Sono state valutate stabilità dei fronti, profondità e caratteristiche del terreno?",
+        "Sono previste armature, pendenze o sistemi di protezione adeguati?",
+        "Sono presenti accessi e uscite sicure dallo scavo?",
+        "Materiali e mezzi sono mantenuti a distanza sicura dal ciglio?",
+        "Lo scavo è delimitato e segnalato anche nelle ore notturne?",
+        "Sono gestite acqua, cedimenti, atmosfere pericolose e condizioni meteo?",
+        "Sono impediti accessi e soste nel raggio operativo dei mezzi?",
+        "È prevista una verifica prima di ogni turno e dopo eventi che possano alterare lo scavo?",
+    ],
+    "Lavori in quota": [
+        "È stata privilegiata una protezione collettiva rispetto ai DPI anticaduta?",
+        "Ponteggi, parapetti, trabattelli o opere provvisionali sono conformi e verificati?",
+        "Sono individuati e verificati i punti di ancoraggio?",
+        "Imbracature, cordini e dispositivi anticaduta sono integri e idonei?",
+        "I lavoratori hanno formazione e addestramento specifici?",
+        "Sono gestiti caduta materiali e segregazione dell'area sottostante?",
+        "Scale e accessi sono utilizzati esclusivamente nelle condizioni consentite?",
+        "Sono considerate condizioni meteo e vento?",
+        "È disponibile un piano di recupero e soccorso dell'operatore sospeso?",
+        "Sono state verificate interferenze con impianti elettrici e altre lavorazioni?",
+    ],
+    "PLE": [
+        "La PLE è idonea alla quota, allo sbraccio e alle condizioni del terreno?",
+        "Sono disponibili verifiche periodiche, controlli e manuale d'uso?",
+        "L'operatore è abilitato e autorizzato all'utilizzo?",
+        "È stata eseguita la verifica pre-uso?",
+        "Stabilizzatori e piastre sono correttamente posizionati?",
+        "Sono rispettati i limiti di portata e numero di occupanti?",
+        "Sono gestite distanze da linee elettriche e ostacoli?",
+        "L'area sottostante e il raggio di manovra sono segregati?",
+        "È previsto l'utilizzo dei DPI anticaduta indicati dal costruttore?",
+        "È noto il sistema di discesa di emergenza e presente personale addestrato a terra?",
+    ],
+    "Hot Work": [
+        "È stato emesso il permesso di lavoro a caldo?",
+        "Sono stati rimossi o protetti i materiali combustibili?",
+        "Sono disponibili estintori idonei e facilmente raggiungibili?",
+        "È stato nominato il fire watch quando necessario?",
+        "Bombole, tubazioni e riduttori sono integri e correttamente posizionati?",
+        "È garantita adeguata ventilazione?",
+        "Sono controllate scintille, scorie e propagazione del calore verso aree adiacenti?",
+        "Sono gestite atmosfere potenzialmente esplosive o infiammabili?",
+        "I lavoratori utilizzano DPI idonei a calore, radiazioni e fumi?",
+        "È previsto il controllo dell'area al termine dell'attività?",
+    ],
+    "Spazi confinati": [
+        "L'ambiente è stato classificato e autorizzato come spazio confinato / sospetto di inquinamento?",
+        "È disponibile una procedura specifica e un permesso di ingresso?",
+        "Sono stati isolati impianti, energie e possibili ingressi di sostanze?",
+        "Sono state eseguite misure atmosferiche prima e durante l'accesso?",
+        "Sono garantite ventilazione e condizioni respirabili?",
+        "Gli addetti possiedono formazione e addestramento specifici?",
+        "È presente un sorvegliante esterno dedicato?",
+        "Sono disponibili comunicazioni efficaci tra interno ed esterno?",
+        "È predisposto un piano di emergenza con attrezzature di recupero?",
+        "È impedito l'accesso a personale non autorizzato?",
+    ],
+    "Movimentazione mezzi": [
+        "È definito e segnalato il piano di viabilità del cantiere?",
+        "Sono separati, ove possibile, percorsi pedonali e carrabili?",
+        "Mezzi e operatori sono autorizzati e in possesso dei requisiti previsti?",
+        "Sono stati eseguiti i controlli pre-uso dei mezzi?",
+        "Sono funzionanti segnalatori acustici, luminosi e dispositivi di visibilità?",
+        "Sono individuati punti ciechi e necessità di moviere?",
+        "Velocità e sensi di marcia sono definiti e rispettati?",
+        "Le aree di carico, scarico e manovra sono segregate?",
+        "Sono gestite interferenze con scavi, sollevamenti e lavorazioni a terra?",
+        "Le condizioni del fondo e delle piste sono adeguate?",
+    ],
+    "Attività civili": [
+        "Le aree di lavoro sono ordinate, pulite e prive di ostacoli?",
+        "Sono verificati accessi, percorsi e protezioni dei bordi?",
+        "Attrezzature manuali ed elettriche sono idonee e controllate?",
+        "Sono gestite polveri, rumore e proiezione di materiali?",
+        "Sono previste modalità sicure per taglio, perforazione e demolizioni minori?",
+        "Sono stoccati correttamente materiali e prodotti?",
+        "Sono controllate le interferenze con impianti esistenti e sottoservizi?",
+        "Sono disponibili i DPI specifici per le attività?",
+    ],
+    "Attività meccaniche": [
+        "Macchine e componenti sono stabilizzati prima delle lavorazioni?",
+        "Sono isolate e scaricate le energie residue?",
+        "Attrezzi e attrezzature sono adatti e in buono stato?",
+        "Sono gestiti schiacciamento, cesoiamento e intrappolamento?",
+        "Sono previsti sistemi sicuri per movimentazione e posizionamento dei componenti?",
+        "Sono controllati fluidi in pressione e temperature residue?",
+        "Sono definite le modalità di prova e rimessa in servizio?",
+        "L'area è segregata durante prove, avviamenti e movimentazioni?",
+    ],
+}
 
-    for paragraph in paragraphs:
-        paragraph = paragraph.strip()
+ACTIVITY_TO_CHECKLIST = {
+    "elettrici": "Lavori elettrici",
+    "scavi": "Scavi",
+    "lavori in quota": "Lavori in quota",
+    "sollevamenti": "Sollevamenti",
+    "spazi confinati": "Spazi confinati",
+    "hot work": "Hot Work",
+    "movimentazione mezzi": "Movimentazione mezzi",
+    "civili": "Attività civili",
+    "meccanici": "Attività meccaniche",
+}
 
-        if not paragraph:
-            if lines and lines[-1] != "":
-                lines.append("")
+
+def generate_checklist_word(data, selected_sections):
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = DocxInches(0.65)
+    section.bottom_margin = DocxInches(0.65)
+    section.left_margin = DocxInches(0.7)
+    section.right_margin = DocxInches(0.7)
+
+    styles = document.styles
+    styles["Normal"].font.name = "Arial"
+    styles["Normal"].font.size = Pt(9)
+
+    title = document.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title.add_run("CHECKLIST HSE PRE-ATTIVITÀ")
+    run.bold = True
+    run.font.size = Pt(16)
+
+    subtitle = document.add_paragraph()
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle.add_run("Verifica preventiva da compilare a cura dell'HSE di cantiere").italic = True
+
+    info_table = document.add_table(rows=3, cols=4)
+    info_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    info_table.style = "Table Grid"
+    info_values = [
+        ("Cantiere", data.get("nome", ""), "Data", datetime.now().strftime("%d/%m/%Y")),
+        ("Fase", data.get("fase", ""), "Impresa", ""),
+        ("Compilata da", "", "Attività / area", ""),
+    ]
+    for row, values in zip(info_table.rows, info_values):
+        for index, value in enumerate(values):
+            row.cells[index].text = str(value)
+            row.cells[index].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            if index in (0, 2):
+                row.cells[index].paragraphs[0].runs[0].bold = True
+
+    document.add_paragraph()
+    legend = document.add_paragraph()
+    legend.add_run("Modalità di compilazione: ").bold = True
+    legend.add_run("barrare SÌ, NO oppure N.A. e riportare nelle note le azioni necessarie.")
+
+    for section_name in selected_sections:
+        questions = CHECKLIST_LIBRARY.get(section_name, [])
+        if not questions:
             continue
 
-        words = paragraph.split()
-        current = ""
+        heading = document.add_paragraph()
+        heading.paragraph_format.space_before = Pt(10)
+        heading.paragraph_format.space_after = Pt(4)
+        run = heading.add_run(section_name.upper())
+        run.bold = True
+        run.font.size = Pt(11)
 
-        for word in words:
-            candidate = f"{current} {word}".strip()
-            bbox = draw.textbbox((0, 0), candidate, font=font)
+        table = document.add_table(rows=1, cols=6)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.style = "Table Grid"
+        headers = ["N.", "Verifica", "SÌ", "NO", "N.A.", "Note / azioni"]
+        for index, header in enumerate(headers):
+            cell = table.rows[0].cells[index]
+            cell.text = header
+            cell.paragraphs[0].runs[0].bold = True
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
-            if bbox[2] - bbox[0] <= max_width:
-                current = candidate
-            else:
-                if current:
-                    lines.append(current)
-                current = word
+        for number, question in enumerate(questions, start=1):
+            cells = table.add_row().cells
+            cells[0].text = str(number)
+            cells[1].text = question
+            cells[2].text = "☐"
+            cells[3].text = "☐"
+            cells[4].text = "☐"
+            cells[5].text = ""
+            for cell in cells:
+                cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
-                if max_lines and len(lines) >= max_lines:
-                    break
+        widths = [0.35, 4.55, 0.45, 0.45, 0.5, 1.45]
+        for row in table.rows:
+            for index, width in enumerate(widths):
+                row.cells[index].width = DocxInches(width)
 
-        if current and (not max_lines or len(lines) < max_lines):
-            lines.append(current)
+    document.add_paragraph()
+    notes = document.add_paragraph()
+    notes.add_run("NOTE GENERALI / AZIONI DA INTRAPRENDERE").bold = True
+    for _ in range(4):
+        document.add_paragraph("________________________________________________________________________________")
 
-        if max_lines and len(lines) >= max_lines:
-            break
+    signatures = document.add_table(rows=2, cols=3)
+    signatures.alignment = WD_TABLE_ALIGNMENT.CENTER
+    signatures.style = "Table Grid"
+    for index, label in enumerate(["HSE di cantiere", "Preposto", "Responsabile impresa"]):
+        signatures.cell(0, index).text = label
+        signatures.cell(0, index).paragraphs[0].runs[0].bold = True
+        signatures.cell(1, index).text = "\nFirma: __________________________\n"
 
-    if max_lines and len(lines) > max_lines:
-        lines = lines[:max_lines]
+    footer = document.sections[0].footer.paragraphs[0]
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    footer.add_run("Checklist HSE generata tramite HSE Risk Platform")
 
-    if max_lines and len(lines) == max_lines:
-        last = lines[-1]
-        if not last.endswith("…"):
-            lines[-1] = last.rstrip(".,;: ") + "…"
-
-    return lines
-
-
-def draw_panel(draw, box, outline=(30, 165, 255), fill=(3, 14, 45, 225)):
-    draw.rounded_rectangle(
-        box,
-        radius=18,
-        fill=fill,
-        outline=outline,
-        width=3
-    )
-
-
-def draw_wrapped_text(
-    draw,
-    text,
-    box,
-    font,
-    fill=(225, 239, 255),
-    spacing=5,
-    max_lines=None
-):
-    x1, y1, x2, y2 = box
-    lines = wrap_text_pixels(
-        draw,
-        text,
-        font,
-        max_width=x2 - x1,
-        max_lines=max_lines
-    )
-
-    y = y1
-    line_height = font.getbbox("Ag")[3] - font.getbbox("Ag")[1] + spacing
-
-    for line in lines:
-        if y + line_height > y2:
-            break
-
-        draw.text(
-            (x1, y),
-            line,
-            font=font,
-            fill=fill
-        )
-        y += line_height
-
-
-def generate_export_infographic(
-    data,
-    risk,
-    level,
-    driver_df,
-    action_plan_df,
-    summary,
-    root_cause,
-    technical_data
-):
-    template_path = get_template_path()
-
-    if template_path is None:
-        return None
-
-    image = Image.open(template_path).convert("RGBA")
-    width, height = image.size
-
-    # Overlay leggero per migliorare la leggibilità dei dati dinamici.
-    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(overlay)
-
-    # Fascia risultati nella parte centrale/inferiore.
-    panel_box = (
-        int(width * 0.12),
-        int(height * 0.31),
-        int(width * 0.88),
-        int(height * 0.79)
-    )
-
-    draw_panel(
-        overlay_draw,
-        panel_box,
-        fill=(2, 10, 35, 238)
-    )
-
-    image = Image.alpha_composite(image, overlay)
-    draw = ImageDraw.Draw(image)
-
-    title_font = get_font(max(22, int(width * 0.026)), bold=True)
-    risk_font = get_font(max(54, int(width * 0.075)), bold=True)
-    heading_font = get_font(max(17, int(width * 0.018)), bold=True)
-    body_font = get_font(max(13, int(width * 0.0135)))
-    small_font = get_font(max(11, int(width * 0.0115)))
-
-    x1, y1, x2, y2 = panel_box
-    pad = int(width * 0.025)
-
-    draw.text(
-        (x1 + pad, y1 + pad),
-        f"{data['nome']} · {datetime.now().strftime('%d/%m/%Y')}",
-        font=title_font,
-        fill=(67, 190, 255)
-    )
-
-    # Risk Index
-    risk_x = x1 + pad
-    risk_y = y1 + int(height * 0.07)
-
-    draw.text(
-        (risk_x, risk_y),
-        f"{round(risk)}",
-        font=risk_font,
-        fill=(255, 255, 255)
-    )
-
-    draw.text(
-        (risk_x, risk_y + int(height * 0.085)),
-        f"RISK INDEX / 100 · {level.upper()}",
-        font=heading_font,
-        fill=(67, 190, 255)
-    )
-
-    draw.text(
-        (risk_x, risk_y + int(height * 0.125)),
-        (
-            f"Fase: {data['fase']}  |  "
-            f"Interferenza: {data['interference_level']}/10  |  "
-            f"Detection: {technical_data['nc_detection_ratio']}"
-        ),
-        font=small_font,
-        fill=(205, 225, 245)
-    )
-
-    # Driver principali
-    positive_drivers = (
-        driver_df[driver_df["Valore"] > 0]
-        .sort_values("Valore", ascending=False)
-        .head(4)
-    )
-
-    driver_text = "\n".join(
-        f"• {row['Driver']}: +{float(row['Valore']):.1f}"
-        for _, row in positive_drivers.iterrows()
-    ) or "• Nessun driver negativo dominante"
-
-    drivers_box = (
-        x1 + int(width * 0.27),
-        y1 + int(height * 0.075),
-        x1 + int(width * 0.49),
-        y1 + int(height * 0.225)
-    )
-
-    draw.text(
-        (drivers_box[0], drivers_box[1] - int(height * 0.03)),
-        "DRIVER PRINCIPALI",
-        font=heading_font,
-        fill=(67, 190, 255)
-    )
-
-    draw_wrapped_text(
-        draw,
-        driver_text,
-        drivers_box,
-        body_font,
-        max_lines=7
-    )
-
-    # Action plan
-    actions = action_plan_df.head(4)["Azione"].tolist()
-    action_text = "\n".join(
-        f"{index + 1}. {action}"
-        for index, action in enumerate(actions)
-    )
-
-    action_box = (
-        x1 + int(width * 0.51),
-        y1 + int(height * 0.075),
-        x2 - pad,
-        y1 + int(height * 0.225)
-    )
-
-    draw.text(
-        (action_box[0], action_box[1] - int(height * 0.03)),
-        "AZIONI PRIORITARIE",
-        font=heading_font,
-        fill=(67, 190, 255)
-    )
-
-    draw_wrapped_text(
-        draw,
-        action_text,
-        action_box,
-        body_font,
-        max_lines=7
-    )
-
-    # Summary e Root Cause in basso
-    lower_top = y1 + int(height * 0.25)
-    middle_x = x1 + int((x2 - x1) * 0.5)
-
-    summary_box = (
-        x1 + pad,
-        lower_top + int(height * 0.035),
-        middle_x - int(width * 0.018),
-        y2 - pad
-    )
-
-    root_box = (
-        middle_x + int(width * 0.018),
-        lower_top + int(height * 0.035),
-        x2 - pad,
-        y2 - pad
-    )
-
-    draw.text(
-        (summary_box[0], lower_top),
-        "REPORT RIASSUNTIVO",
-        font=heading_font,
-        fill=(67, 190, 255)
-    )
-
-    draw_wrapped_text(
-        draw,
-        summary,
-        summary_box,
-        small_font,
-        max_lines=13
-    )
-
-    draw.text(
-        (root_box[0], lower_top),
-        "ROOT CAUSE",
-        font=heading_font,
-        fill=(67, 190, 255)
-    )
-
-    draw_wrapped_text(
-        draw,
-        root_cause,
-        root_box,
-        small_font,
-        max_lines=13
-    )
-
-    output = BytesIO()
-    image.convert("RGB").save(
-        output,
-        format="PNG",
-        optimize=True
-    )
-    output.seek(0)
-
-    return output
+    buffer = BytesIO()
+    document.save(buffer)
+    buffer.seek(0)
+    return buffer
 
 
 # =========================================================
@@ -2256,7 +2195,9 @@ def generate_ppt(
     summary,
     root_cause,
     toolbox,
-    technical_data
+    technical_data,
+    scorecard_df,
+    scorecard_overall
 ):
     prs = Presentation()
 
@@ -2390,6 +2331,38 @@ def generate_ppt(
         .replace("**", "")
     )[:1800]
 
+    slide = prs.slides.add_slide(
+        prs.slide_layouts[5]
+    )
+
+    slide.shapes.title.text = "HSE Scorecard"
+
+    score_table = slide.shapes.add_table(
+        len(scorecard_df) + 2,
+        4,
+        Inches(0.6),
+        Inches(1.25),
+        Inches(8.6),
+        Inches(4.8)
+    ).table
+
+    score_table.cell(0, 0).text = "Area"
+    score_table.cell(0, 1).text = "Stelle"
+    score_table.cell(0, 2).text = "Punteggio"
+    score_table.cell(0, 3).text = "Motivazione"
+
+    for index, row in scorecard_df.iterrows():
+        score_table.cell(index + 1, 0).text = str(row["Area"])
+        score_table.cell(index + 1, 1).text = str(row["Stelle"])
+        score_table.cell(index + 1, 2).text = f"{float(row['Punteggio']):.1f} / 10"
+        score_table.cell(index + 1, 3).text = str(row["Motivazione"])
+
+    last_row = len(scorecard_df) + 1
+    score_table.cell(last_row, 0).text = "VALUTAZIONE COMPLESSIVA"
+    score_table.cell(last_row, 1).text = ""
+    score_table.cell(last_row, 2).text = f"{scorecard_overall:.1f} / 10"
+    score_table.cell(last_row, 3).text = "Media delle cinque aree della scorecard."
+
     return prs
 
 
@@ -2408,7 +2381,9 @@ def generate_excel(
     root_cause,
     toolbox,
     reduce_risk,
-    technical_data
+    technical_data,
+    scorecard_df,
+    scorecard_overall
 ):
     buffer = BytesIO()
 
@@ -2514,6 +2489,19 @@ def generate_excel(
             index=False
         )
 
+        scorecard_export_df = scorecard_df.copy()
+        scorecard_export_df.loc[len(scorecard_export_df)] = {
+            "Area": "Valutazione complessiva",
+            "Punteggio": scorecard_overall,
+            "Motivazione": "Media delle cinque aree della scorecard",
+            "Stelle": ""
+        }
+        scorecard_export_df.to_excel(
+            writer,
+            sheet_name="HSE Scorecard",
+            index=False
+        )
+
     buffer.seek(0)
 
     return buffer
@@ -2573,7 +2561,8 @@ def run_calculation(data):
         data,
         risk,
         level,
-        technical_data
+        technical_data,
+        driver_df
     )
 
     toolbox = local_toolbox_talk(
@@ -2594,6 +2583,12 @@ def run_calculation(data):
         technical_data
     )
 
+    scorecard_df, scorecard_overall = generate_hse_scorecard(
+        data,
+        risk,
+        technical_data
+    )
+
     st.session_state.report = {
         "data": data,
         "risk": risk,
@@ -2606,7 +2601,9 @@ def run_calculation(data):
         "toolbox": toolbox,
         "action_plan_df": action_plan_df,
         "reduce_risk": reduce_risk,
-        "technical_data": technical_data
+        "technical_data": technical_data,
+        "scorecard_df": scorecard_df,
+        "scorecard_overall": scorecard_overall
     }
 
     st.session_state.calcolo_effettuato = True
@@ -2643,7 +2640,7 @@ with st.sidebar:
         value="Cantiere Demo",
         help=(
             "Identifica il sito o il progetto. Il nome viene riportato "
-            "nei report PowerPoint, Excel e nell'infografica PNG."
+            "nei report PowerPoint, Excel e nella checklist Word."
         )
     )
 
@@ -2966,6 +2963,8 @@ toolbox = report["toolbox"]
 action_plan_df = report["action_plan_df"]
 reduce_risk = report["reduce_risk"]
 technical_data = report["technical_data"]
+scorecard_df = report["scorecard_df"]
+scorecard_overall = report["scorecard_overall"]
 
 
 # =========================================================
@@ -3070,7 +3069,7 @@ st.divider()
 # =========================================================
 # TAB
 # =========================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "🎯 Azioni e alert",
     "📋 Action Plan",
     "🔍 Root Cause",
@@ -3078,217 +3077,118 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📉 Riduci rischio",
     "🧮 Dettaglio calcolo",
     "💬 HSE Advisor",
+    "⭐ HSE Scorecard",
+    "📑 HSE Toolkit",
     "📤 Export"
 ])
 
-
 with tab1:
-    st.subheader(
-        "Azioni e alert generati dal motore"
-    )
-
-    st.dataframe(
-        actions_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
+    st.subheader("Azioni e alert generati dal motore")
+    st.dataframe(actions_df, use_container_width=True, hide_index=True)
 
 with tab2:
-    st.subheader(
-        "Action Plan operativo"
-    )
-
-    st.dataframe(
-        action_plan_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
+    st.subheader("Action Plan operativo")
+    st.dataframe(action_plan_df, use_container_width=True, hide_index=True)
 
 with tab3:
-    st.subheader(
-        "Root Cause Analysis locale"
-    )
-
+    st.subheader("Root Cause Analysis per categorie")
+    st.caption("La motivazione del punteggio è organizzata per area e collegata ai contributi effettivi dei driver.")
     st.markdown(root_cause)
 
-
 with tab4:
-    st.subheader(
-        "Toolbox Talk locale"
-    )
-
+    st.subheader("Toolbox Talk locale")
     st.markdown(toolbox)
 
-
 with tab5:
-    st.subheader(
-        "Come ridurre il rischio"
-    )
-
+    st.subheader("Come ridurre il rischio")
     st.markdown(reduce_risk)
 
-
 with tab6:
-    st.subheader(
-        "Motivazione tecnica del calcolo"
-    )
+    st.subheader("Motivazione tecnica del calcolo")
+    st.dataframe(explanations_df, use_container_width=True, hide_index=True)
 
-    st.dataframe(
-        explanations_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.subheader(
-        "Indicatori tecnici"
-    )
-
+    st.subheader("Indicatori tecnici")
     technical_df = pd.DataFrame([
-        {
-            "Indicatore": "Indice di detection",
-            "Valore":
-                technical_data["nc_detection_ratio"],
-            "Descrizione":
-                "Rapporto tra NC totali e ispezioni"
-        },
-        {
-            "Indicatore": "Interference score",
-            "Valore":
-                technical_data["interference_score"],
-            "Descrizione":
-                "Interferenza corretta per tipo e numero attività"
-        },
-        {
-            "Indicatore":
-                "Fattore criticità attività",
-            "Valore":
-                technical_data[
-                    "activity_criticality_factor"
-                ],
-            "Descrizione":
-                "Peso dell'attività più critica"
-        },
-        {
-            "Indicatore":
-                "Fattore numero attività",
-            "Valore":
-                technical_data[
-                    "activity_count_factor"
-                ],
-            "Descrizione":
-                "Correttivo per contemporaneità"
-        },
-        {
-            "Indicatore":
-                "Correttivo copertura HSE",
-            "Valore":
-                technical_data[
-                    "hse_coverage_adjustment"
-                ],
-            "Descrizione":
-                technical_data[
-                    "hse_coverage_status"
-                ]
-        },
-        {
-            "Indicatore": "Bonus Stop Work",
-            "Valore": -technical_data["stop_work_bonus"],
-            "Descrizione":
-                "Solo bonus, con impatto massimo limitato a -6"
-        },
-        {
-            "Indicatore": "Impatto diretto fase",
-            "Valore": technical_data["phase_direct_impact"],
-            "Descrizione":
-                "La fase non incide direttamente sul Risk Index"
-        },
-        {
-            "Indicatore": "Bonus coerenza fase/sensibilizzazioni",
-            "Valore": -technical_data["phase_awareness_bonus"],
-            "Descrizione": (
-                ", ".join(technical_data["phase_awareness_matches"])
-                if technical_data["phase_awareness_matches"]
-                else "Nessuna corrispondenza"
-            )
-        }
+        {"Indicatore": "Indice di detection", "Valore": technical_data["nc_detection_ratio"], "Descrizione": "Rapporto tra NC totali e ispezioni"},
+        {"Indicatore": "Interference score", "Valore": technical_data["interference_score"], "Descrizione": "Interferenza corretta per tipo e numero attività"},
+        {"Indicatore": "Fattore criticità attività", "Valore": technical_data["activity_criticality_factor"], "Descrizione": "Peso dell'attività più critica"},
+        {"Indicatore": "Fattore numero attività", "Valore": technical_data["activity_count_factor"], "Descrizione": "Correttivo per contemporaneità"},
+        {"Indicatore": "Correttivo copertura HSE", "Valore": technical_data["hse_coverage_adjustment"], "Descrizione": technical_data["hse_coverage_status"]},
+        {"Indicatore": "Bonus Stop Work", "Valore": -technical_data["stop_work_bonus"], "Descrizione": "Solo bonus, con impatto massimo limitato a -6"},
+        {"Indicatore": "Impatto diretto fase", "Valore": technical_data["phase_direct_impact"], "Descrizione": "La fase non incide direttamente sul Risk Index"},
+        {"Indicatore": "Bonus coerenza fase/sensibilizzazioni", "Valore": -technical_data["phase_awareness_bonus"], "Descrizione": ", ".join(technical_data["phase_awareness_matches"]) if technical_data["phase_awareness_matches"] else "Nessuna corrispondenza"}
     ])
-
-    st.dataframe(
-        technical_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
+    st.dataframe(technical_df, use_container_width=True, hide_index=True)
 
 with tab7:
-    st.subheader(
-        "Chiedi all'HSE Advisor locale"
-    )
-
+    st.subheader("Chiedi all'HSE Advisor locale")
     question = st.text_input(
         "Fai una domanda sul report",
-        placeholder=(
-            "Esempio: la copertura HSE è sufficiente?"
-        ),
+        placeholder="Esempio: la copertura HSE è sufficiente?",
         key="advisor_question"
     )
-
-    if st.button(
-        "Chiedi all'Advisor",
-        key="advisor_button"
-    ):
+    if st.button("Chiedi all'Advisor", key="advisor_button"):
         if question.strip():
-            st.session_state.advisor_answer = (
-                local_hse_advisor(
-                    question,
-                    data,
-                    risk,
-                    level,
-                    actions_df,
-                    technical_data
-                )
+            st.session_state.advisor_answer = local_hse_advisor(
+                question, data, risk, level, actions_df, technical_data
             )
         else:
-            st.session_state.advisor_answer = (
-                "Scrivi una domanda."
-            )
-
+            st.session_state.advisor_answer = "Scrivi una domanda."
     if st.session_state.advisor_answer:
-        st.markdown(
-            st.session_state.advisor_answer
-        )
-
+        st.markdown(st.session_state.advisor_answer)
 
 with tab8:
-    st.subheader(
-        "Download report"
+    st.subheader("HSE Scorecard")
+    st.metric("Valutazione complessiva", f"{scorecard_overall:.1f} / 10")
+    for _, row in scorecard_df.iterrows():
+        col_score, col_reason = st.columns([1, 2.3])
+        with col_score:
+            st.markdown(f"### {row['Area']}")
+            st.markdown(f"## {row['Stelle']}")
+            st.markdown(f"**{float(row['Punteggio']):.1f} / 10**")
+        with col_reason:
+            st.write(row["Motivazione"])
+            st.progress(float(row["Punteggio"]) / 10)
+        st.divider()
+
+with tab9:
+    st.subheader("Generatore Checklist HSE")
+    st.info(
+        "La checklist non viene compilata nel tool. Seleziona i capitoli e scarica il format Word da inviare all'HSE di cantiere."
     )
 
-    infographic_buffer = generate_export_infographic(
-        data,
-        risk,
-        level,
-        driver_df,
-        action_plan_df,
-        summary,
-        root_cause,
-        technical_data
+    suggested_sections = ["Controlli generali pre-attività"]
+    suggested_sections.extend(
+        ACTIVITY_TO_CHECKLIST[activity]
+        for activity in data["activities"]
+        if activity in ACTIVITY_TO_CHECKLIST
+    )
+    suggested_sections = list(dict.fromkeys(suggested_sections))
+
+    selected_checklists = st.multiselect(
+        "Capitoli da inserire nel documento",
+        options=list(CHECKLIST_LIBRARY.keys()),
+        default=suggested_sections,
+        help="Le attività già selezionate nel calcolo vengono proposte automaticamente, ma puoi aggiungere o rimuovere capitoli."
     )
 
-    if infographic_buffer is not None:
-        st.markdown("### Infografica dinamica del calcolo")
-        st.image(
-            infographic_buffer,
+    if selected_checklists:
+        total_questions = sum(len(CHECKLIST_LIBRARY[item]) for item in selected_checklists)
+        st.caption(f"Documento composto da {len(selected_checklists)} capitoli e {total_questions} verifiche.")
+        checklist_buffer = generate_checklist_word(data, selected_checklists)
+        st.download_button(
+            label="📥 Scarica Checklist Word",
+            data=checklist_buffer,
+            file_name=f"Checklist_HSE_{safe_filename(data['nome'])}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True
         )
-        infographic_buffer.seek(0)
     else:
-        st.warning(
-            "Template infografica non trovato. Carica il file "
-            "`assets/hse_output_template.png` nel repository GitHub."
-        )
+        st.warning("Seleziona almeno un capitolo da inserire nella checklist.")
+
+with tab10:
+    st.subheader("Download report")
+    st.caption("La sezione Export contiene gli output complessivi del Risk Tool. La checklist Word rimane disponibile nell'HSE Toolkit.")
 
     ppt = generate_ppt(
         data,
@@ -3299,9 +3199,10 @@ with tab8:
         summary,
         root_cause,
         toolbox,
-        technical_data
+        technical_data,
+        scorecard_df,
+        scorecard_overall
     )
-
     ppt_buffer = BytesIO()
     ppt.save(ppt_buffer)
     ppt_buffer.seek(0)
@@ -3318,26 +3219,20 @@ with tab8:
         root_cause,
         toolbox,
         reduce_risk,
-        technical_data
+        technical_data,
+        scorecard_df,
+        scorecard_overall
     )
 
-    filename = safe_filename(
-        data["nome"]
-    )
-
-    col_a, col_b, col_c = st.columns(3)
+    filename = safe_filename(data["nome"])
+    col_a, col_b = st.columns(2)
 
     with col_a:
         st.download_button(
             label="📥 Scarica PowerPoint",
             data=ppt_buffer,
-            file_name=(
-                f"HSE_Risk_Report_{filename}.pptx"
-            ),
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "presentationml.presentation"
-            ),
+            file_name=f"HSE_Risk_Report_{filename}.pptx",
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
             use_container_width=True
         )
 
@@ -3345,12 +3240,7 @@ with tab8:
         st.download_button(
             label="📥 Scarica Excel",
             data=excel_buffer,
-            file_name=(
-                f"HSE_Risk_Report_{filename}.xlsx"
-            ),
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
+            file_name=f"HSE_Risk_Report_{filename}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )

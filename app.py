@@ -1,10 +1,10 @@
-"""HSE Risk Platform 2.0 — modello gestionale trasparente, non predittivo.
+"""HSE Risk Platform 3.0 — modello gestionale trasparente, non predittivo.
 Avvio: streamlit run app.py. Tutti gli input sono riferiti al mese selezionato.
 Nessuna chiamata a modelli AI, nessuna API a pagamento.
 """
 from __future__ import annotations
-from io import BytesIO
-from datetime import datetime, date, timezone
+from io import BytesIO, StringIO
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from copy import deepcopy
 import calendar
@@ -17,6 +17,9 @@ import sqlite3
 import unicodedata
 import uuid
 import textwrap
+import csv
+import html
+import hashlib
 import pandas as pd
 import altair as alt
 import streamlit as st
@@ -29,7 +32,7 @@ from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.shared import Pt, Inches as DocxInches
 
 MODEL_VERSION = '2.0.0'
-UI_VERSION = '2.0.2'
+UI_VERSION = '3.0.0'
 SCHEMA_VERSION = 2
 WEIGHTS = {'NC formali': 30, 'Criticità informali': 8, 'Attività': 22,
            'Interferenze': 15, 'Organizzazione': 10, 'Presidio e controlli': 15}
@@ -456,6 +459,7 @@ class HistoryStore:
         if mode != 'session':
             with self.connect() as conn:
                 conn.execute('CREATE TABLE IF NOT EXISTS hse_evaluations (id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+                conn.execute('CREATE TABLE IF NOT EXISTS hse_weekly_plans (id TEXT PRIMARY KEY, plan_key TEXT NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL, UNIQUE(plan_key,revision))')
 
     def connect(self):
         if self.mode == 'postgres':
@@ -481,6 +485,37 @@ class HistoryStore:
         with self.connect() as conn:
             for record in records:
                 conn.execute(sql, (record['id'], json.dumps(record, ensure_ascii=False, allow_nan=False)))
+
+
+    def all_weekly(self):
+        if self.mode=='session':
+            return deepcopy(st.session_state.setdefault('weekly_records',[]))
+        with self.connect() as conn:
+            return [json.loads(x[0]) for x in conn.execute('SELECT payload FROM hse_weekly_plans').fetchall()]
+
+    def save_weekly(self,record):
+        self.import_weekly([record])
+
+    def import_weekly(self,records):
+        existing=self.all_weekly()
+        by_id={x['id']:x for x in existing}
+        by_revision={(x['plan_key'],x['revision']):x for x in existing}
+        fresh=[]
+        for record in records:
+            key=(record['plan_key'],record['revision'])
+            if record['id'] in by_id:
+                if by_id[record['id']]!=record:raise ValueError('Conflitto identificativo.')
+                continue
+            if key in by_revision:raise ValueError('Conflitto revisione.')
+            by_id[record['id']]=record;by_revision[key]=record;fresh.append(record)
+        if self.mode=='session':
+            st.session_state.weekly_records=existing+deepcopy(fresh)
+            return
+        token='%s' if self.mode=='postgres' else '?'
+        sql='INSERT INTO hse_weekly_plans (id,plan_key,revision,payload) VALUES ('+','.join([token]*4)+')'
+        with self.connect() as conn:
+            for record in fresh:
+                conn.execute(sql,(record['id'],record['plan_key'],record['revision'],json.dumps(record,ensure_ascii=False,allow_nan=False)))
 
 
 def new_record(d, r):
@@ -912,6 +947,16 @@ h1,h2,h3{color:#123047;letter-spacing:-.025em}
 [data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px}
 [data-testid="stCaptionContainer"]{color:#415c70}
 @media(max-width:700px){.block-container{padding:1rem}.stApp h1{font-size:1.9rem}}
+.hero{padding:26px 0 30px}.hero p{font-size:1.2rem;color:#415c70}.eyebrow{font-size:.8rem;letter-spacing:.18em;color:#087f8c;font-weight:700}
+[data-testid="stVerticalBlockBorderWrapper"]{background:#fff;border-color:#d8e3eb!important;box-shadow:0 3px 14px #12304708}
+[data-testid="stButton"] button{min-height:44px;font-weight:600}
+[data-testid="stPills"] button{border-radius:8px}
+.week-grid{display:grid;grid-template-columns:repeat(7,minmax(130px,1fr));gap:9px;margin:20px 0;overflow-x:auto}
+.week-day{background:#eaf0f5;border:1px solid #d7e1ea;border-radius:10px;padding:12px;min-width:130px}
+.week-day h4{font-size:1rem;margin:0 0 12px;color:#123047}
+.event{background:#fff;border-left:4px solid #087f8c;border-radius:6px;padding:10px;margin-bottom:10px;overflow-wrap:anywhere;font-size:.88rem}
+.event span{display:inline-block;margin-top:6px;color:#225873}.event small,.muted{color:#415c70;font-size:.8rem}
+@media(max-width:850px){.week-grid{grid-template-columns:repeat(2,minmax(140px,1fr))}}
 </style>'''
 
 
@@ -933,19 +978,59 @@ def clean_rows(frame, awareness=False):
     return rows
 
 
-def anomaly_editor(label, rows, key):
-    st.markdown('**' + label + '**')
-    frame = pd.DataFrame(rows, columns=['theme', 'severity', 'status', 'late', 'repeat', 'note'])
-    config = {
-       'theme': st.column_config.SelectboxColumn('Tema', options=THEMES, required=True),
-       'severity': st.column_config.SelectboxColumn('Gravità', options=list(SEVERITY), required=True),
-       'status': st.column_config.SelectboxColumn('Stato a fine mese', options=list(STATUS), required=True),
-       'late': st.column_config.CheckboxColumn('Aperta scaduta', default=False),
-       'repeat': st.column_config.CheckboxColumn('Recidiva', default=False),
-       'note': st.column_config.TextColumn('Descrizione / riferimento')}
-    return clean_rows(st.data_editor(frame, num_rows='dynamic', column_config=config, hide_index=True,
-                                    width='stretch', key=key))
+def add_editor_card(state_key, awareness=False):
+    row = {'theme': None, 'count': 1, 'coverage': None} if awareness else {
+        'theme': None, 'severity': None, 'status': 'Aperta', 'late': False, 'repeat': False, 'note': ''}
+    st.session_state[state_key].append({'uid': uuid.uuid4().hex, **row})
 
+
+def remove_editor_card(state_key, uid):
+    st.session_state[state_key] = [x for x in st.session_state[state_key] if x['uid'] != uid]
+
+
+def card_editor(label, rows, key, awareness=False):
+    state_key = key + '_cards'
+    if state_key not in st.session_state:
+        st.session_state[state_key] = [{'uid': uuid.uuid4().hex, **deepcopy(x)} for x in rows]
+    st.markdown('### ' + label)
+    entries = st.session_state[state_key]
+    if not entries:
+        st.info('Nessuna voce inserita. Usa il pulsante Aggiungi qui sotto per creare la prima scheda.')
+    result = []
+    for index, item in enumerate(entries):
+        uid = item['uid']; prefix = key + '_' + uid
+        with st.container(border=True):
+            title, remove = st.columns([5, 1])
+            title.markdown(f"**{'\U0001f9e0 Sensibilizzazione' if awareness else '\U0001f4dd Segnalazione'} {index + 1}**")
+            remove.button('Rimuovi', key=prefix+'_remove', icon='\U0001f5d1\ufe0f', on_click=remove_editor_card, args=(state_key,uid))
+            theme = st.selectbox('Argomento' if awareness else 'Tema della segnalazione', THEMES,
+                index=THEMES.index(item['theme']) if item.get('theme') in THEMES else None,
+                placeholder='Seleziona un tema', key=prefix+'_theme')
+            if awareness:
+                a,b = st.columns(2)
+                count = a.number_input('Incontri effettuati nel mese',1,1000,int(item.get('count',1)),key=prefix+'_count')
+                known = b.checkbox('Conosco la copertura dei destinatari',value=item.get('coverage') is not None,key=prefix+'_known')
+                coverage = st.slider('Destinatari unici raggiunti (%)',0,100,int(item.get('coverage') or 0),key=prefix+'_coverage') if known else None
+                row = dict(theme=theme,count=count,coverage=coverage)
+            else:
+                a,b = st.columns(2)
+                severity = a.selectbox('Gravità',list(SEVERITY),index=list(SEVERITY).index(item['severity']) if item.get('severity') in SEVERITY else None,
+                    placeholder='Seleziona la gravità',key=prefix+'_severity')
+                status = b.selectbox('Stato a fine mese',list(STATUS),index=list(STATUS).index(item.get('status','Aperta')),key=prefix+'_status')
+                late = st.checkbox('Aperta e oltre la scadenza',value=bool(item.get('late')) if status=='Aperta' else False,
+                    disabled=status!='Aperta',key=prefix+'_late') if status=='Aperta' else False
+                repeat = st.checkbox('Segnalazione ricorrente',value=bool(item.get('repeat')),key=prefix+'_repeat')
+                note = st.text_area('Descrizione e riferimento',value=item.get('note',''),max_chars=1000,key=prefix+'_note')
+                row = dict(theme=theme,severity=severity,status=status,late=late,repeat=repeat,note=note)
+            item.update(row)
+            result.append(row)
+    st.button('Aggiungi sensibilizzazione' if awareness else 'Aggiungi NC formale' if key.startswith('nc_') else 'Aggiungi criticità',
+        icon='\u2795',key=key+'_add',on_click=add_editor_card,args=(state_key,awareness),type='secondary',width='stretch')
+    return result
+
+
+def anomaly_editor(label, rows, key):
+    return card_editor(label,rows,key)
 
 def render_form(records):
     if 'draft' not in st.session_state:
@@ -964,7 +1049,7 @@ def render_form(records):
                 st.session_state.draft = {**d, 'nome': chosen}
                 st.session_state.draft_revision = rev + 1
                 st.rerun()
-    with st.form(f'evaluation_{rev}'):
+    with st.container(border=True):
         st.subheader('\U0001f4cd 1 · Cantiere e periodo')
         a, b, c = st.columns([2, 1, 1])
         name = a.text_input('Nome cantiere', d['nome'], max_chars=120, help='Usare lo stesso nome ogni mese per collegare lo storico.')
@@ -973,11 +1058,11 @@ def render_form(records):
         phase = st.selectbox('Fase operativa prevalente', list(PHASE_THEMES), index=list(PHASE_THEMES).index(d['fase']))
         st.caption('Se selezioni il mese corrente, la valutazione è parziale e va confrontata con cautela.')
         st.subheader('\U0001f3d7\ufe0f 2 · Lavorazioni e interferenze')
-        activities = st.multiselect('Attività effettivamente svolte nel mese', list(ACTIVITY), default=d['activities'])
+        activities = st.pills('Seleziona le lavorazioni del mese', list(ACTIVITY), default=d['activities'], selection_mode='multi')
         interference = st.slider('Interferenza fra attività', 1, 10, int(d['interference_level']),
           help='1: attività separate. 3: contatti occasionali gestiti. 5: aree/risorse condivise. 7: sovrapposizioni frequenti. 10: interferenze continue senza separazione efficace.')
         st.subheader('\U0001f50d 3 · Anomalie e follow-up')
-        st.caption('Dopo aver modificato una cella, premi Invio o clicca fuori dalla cella prima di calcolare. Aperte = presenti a fine mese; chiuse = risolte durante il mese. Gravità alta = potenziale danno grave, da motivare nella descrizione. '
+        st.caption('Usa Aggiungi per ogni segnalazione e compila la scheda. Aperte = presenti a fine mese; chiuse = risolte durante il mese. Gravità alta = potenziale danno grave, da motivare nella descrizione. '
                    'Criticità informali: peso inferiore, nessuna soglia automatica. Se formalizzate, rimuoverle dalla tabella informale.')
         nc = anomaly_editor('\U0001f4dd NC formali · massimo 30 punti', d['nc_items'], f'nc_{rev}')
         crit = anomaly_editor('\U0001f4cc Criticità informali · massimo 8 punti', d['crit_items'], f'crit_{rev}')
@@ -1001,14 +1086,9 @@ def render_form(records):
         positive = a.number_input('Stop Work positivi · massimo −2', 0, 1000, int(d['stop_positive']))
         negative = b.number_input('Stop Work negativi · massimo +6', 0, 1000, int(d['stop_negative']))
         st.subheader('\U0001f9e0 6 · Sensibilizzazioni mirate')
-        st.caption('Una riga per tema. Copertura = % di lavoratori destinatari unici raggiunti sul tema nel mese (non somma delle presenze). '
+        st.caption('Una scheda per tema. Copertura = % di lavoratori destinatari unici raggiunti sul tema nel mese (non somma delle presenze). '
                    'Lasciare vuota se sconosciuta: fattore prudenziale 50%. Senza collegamento ad attività, anomalie aperte o fase non c’è bonus.')
-        awareness_frame = pd.DataFrame(d['awareness'], columns=['theme', 'count', 'coverage'])
-        awareness = clean_rows(st.data_editor(awareness_frame, num_rows='dynamic', hide_index=True, width='stretch',
-            key=f'awareness_{rev}', column_config={
-                'theme': st.column_config.SelectboxColumn('Tema', options=THEMES, required=True),
-                'count': st.column_config.NumberColumn('Incontri sul tema', min_value=1, max_value=1000, step=1, required=True),
-                'coverage': st.column_config.NumberColumn('Destinatari unici raggiunti (%)', min_value=0, max_value=100, step=1)}), awareness=True)
+        awareness = card_editor('\U0001f9e0 Sensibilizzazioni effettuate', d['awareness'], f'awareness_{rev}', awareness=True)
         with st.expander('\U0001f4d0 7 · Dati di esposizione FACOLTATIVI'):
             st.write('Puoi lasciare tutto a zero: significa dato non disponibile. Questi dati producono un indice contestualizzato separato, '
                      'senza modificare l’indice base usato nelle graduatorie. I rapporti adottati sono ipotesi gestionali da calibrare.')
@@ -1017,7 +1097,7 @@ def render_form(records):
             workers = b.number_input('Numero medio lavoratori nel mese', 0, 100000, int(d['workers'] or 0))
             days = c.number_input('Giorni di attività nel mese', 0, 31, int(d['days'] or 0))
         notes = st.text_area('Note della valutazione', d['notes'], max_chars=5000)
-        submitted = st.form_submit_button('Calcola la valutazione', icon='\U0001f9ee', type='primary', width='stretch')
+        submitted = st.button('Calcola la valutazione', icon='\U0001f9ee', type='primary', width='stretch')
     if submitted:
         candidate = dict(nome=name.strip(), technology=technology, fase=phase, month=month.strftime('%Y-%m'),
             app=app, sub=sub, company_hse=hse, hse_coverage=coverage, inspections=inspections,
@@ -1102,7 +1182,7 @@ def render_report(store, records):
     else:
         st.info('\U0001f9ea MODALITÀ PROVA · input e output temporanei. In fondo alla pagina scegli Salva e inserisci oppure Non salvare.')
     st.divider()
-    section = st.selectbox('\U0001f9ed Apri una sezione del report', REPORT_SECTIONS, key='report_section')
+    section = st.pills('\U0001f9ed Apri una sezione del report', REPORT_SECTIONS, selection_mode='single', default=REPORT_SECTIONS[0], key='report_section') or REPORT_SECTIONS[0]
     st.subheader(section)
     st.caption('12 sezioni dedicate: sintesi, alert, piano azioni, registro, motivazioni, toolbox, scenari, calcolo, advisor, scorecard, checklist ed export.')
     actions = action_plan(d, r)
@@ -1344,6 +1424,626 @@ def render_archive(store, records):
                  'Usare dati di cantiere essenziali, senza informazioni personali non necessarie.')
 
 
+
+# =========================================================
+# PORTALE IMPRESA E SINOTTICO SETTIMANALE
+# Struttura ricreata dal format; nessuna riga del PDF originale è inclusa.
+# =========================================================
+WEEKLY_SCHEMA = 1
+DAYS_IT = ['Lun','Mar','Mer','Gio','Ven','Sab','Dom']
+YES_NO = ['Da verificare','No','Sì']
+
+
+def default_weekly():
+    start = date.today() - timedelta(days=date.today().weekday())
+    return dict(site='',technology='Wind',prime='',executor='',supervisor='',prime_lead='',executor_lead='',
+                start=start.isoformat(),end=(start+timedelta(days=6)).isoformat(),activities=[],daily_workforce={})
+
+
+def blank_weekly_activity():
+    return dict(id=uuid.uuid4().hex,area='',description='',types=[],roadblock='Da verificare',night='Da verificare',
+                confined='Da verificare',equipment='',hotwork='Da verificare',interference='',
+                prime='',executor='',preposto='',contact='',notes='',days={})
+
+
+def plan_dates(plan, slots=False):
+    start = date.fromisoformat(plan['start'])
+    count = 8 if slots else (date.fromisoformat(plan['end'])-start).days+1
+    return [(start+timedelta(days=i)).isoformat() for i in range(count)]
+
+
+def weekly_questions(plan):
+    """Domande esplicite per ogni campo mancante; nessuna integrazione inventata."""
+    questions=[]
+    if not isinstance(plan,dict):
+        return ['Sinottico non valido.']
+    for key,label in [('site','Qual è il nome del cantiere?'),('prime','Qual è l’impresa affidataria?'),
+       ('executor','Qual è l’impresa esecutrice?'),('supervisor','Chi è il supervisore Enel?'),
+       ('prime_lead','Chi è il capo cantiere dell’affidataria?'),('executor_lead','Chi è il capo cantiere dell’esecutrice?')]:
+        if not isinstance(plan.get(key),str) or not plan[key].strip() or len(plan[key])>160:
+            questions.append(label)
+    if plan.get('technology') not in ['Wind','Solar','BESS']:
+        questions.append('Qual è la tecnologia del cantiere?')
+    try:
+        start,end=date.fromisoformat(plan['start']),date.fromisoformat(plan['end'])
+        if start.weekday()!=0 or not 6 <= (end-start).days <=7:
+            questions.append('Impostare un lunedì e un orizzonte di 7 o 8 giorni consecutivi.')
+        dates=plan_dates(plan)
+    except (KeyError,ValueError,TypeError):
+        return questions+['Quali sono le date di inizio e fine della settimana?']
+    activities=plan.get('activities')
+    if not isinstance(activities,list) or not 1 <=len(activities)<=60:
+        return questions+['Aggiungi da 1 a 60 attività pianificate.']
+    seen=set()
+    for i,row in enumerate(activities,1):
+        if not isinstance(row,dict):
+            questions.append(f'Attività {i}: formato non valido.');continue
+        if not isinstance(row.get('id'),str) or not re.fullmatch(r'[a-f0-9]{32}',row['id']) or row['id'] in seen:
+            questions.append(f'Attività {i}: identificativo non valido o duplicato.')
+        seen.add(row.get('id',''))
+        labels={'area':'In quale area si svolge?', 'description':'Qual è la descrizione della lavorazione?',
+                'equipment':'Quali mezzi sono previsti? Scrivi Non previsti se assenti.',
+                'interference':'Quali ulteriori rischi/interferenze? Scrivi Non rilevati se assenti.',
+                'prime':'Qual è l’affidataria della lavorazione?', 'executor':'Qual è l’esecutrice della lavorazione?',
+                'preposto':'Chi è il preposto della lavorazione?', 'contact':'Qual è il contatto reperibile del preposto?'}
+        for field,label in labels.items():
+            if not isinstance(row.get(field),str) or not row[field].strip() or len(row[field])>(1200 if field in ['description','interference','equipment'] else 160):
+                questions.append(f'Attività {i}: {label}')
+        if not isinstance(row.get('notes',''),str) or len(row.get('notes',''))>1200:
+            questions.append(f'Attività {i}: note troppo lunghe.')
+        for field,label in [('night','È previsto orario notturno?'),('confined','È previsto accesso a spazio confinato?'),('hotwork','Sono previsti lavori a caldo?')]:
+            if row.get(field) not in ['Sì','No']:
+                questions.append(f'Attività {i}: {label}')
+        if not isinstance(row.get('roadblock'),str) or not row['roadblock'].strip() or row['roadblock']=='Da verificare' or len(row['roadblock'])>300:
+            questions.append(f'Attività {i}: quali interruzioni di aree/strade? Scrivi Non previste se assenti.')
+        types=row.get('types')
+        if not isinstance(types,list) or not types or any(x not in ACTIVITY for x in types) or len(types)!=len(set(types)):
+            questions.append(f'Attività {i}: quali tipologie di lavoro servono per la checklist?')
+        days=row.get('days')
+        if not isinstance(days,dict) or not days:
+            questions.append(f'Attività {i}: in quali giorni si lavora e con quante persone?')
+        else:
+            for day,count in days.items():
+                if day not in dates or isinstance(count,bool) or not isinstance(count,int) or not 1<=count<=10000:
+                    questions.append(f'Attività {i}: giorno o numero persone non valido.')
+    totals=plan.get('daily_workforce',{})
+    if not isinstance(totals,dict):
+        questions.append('Completare la forza lavoro giornaliera verificata.');return questions
+    for day in dates:
+        assignments=[row.get('days',{}).get(day,0) for row in activities if isinstance(row,dict) and isinstance(row.get('days'),dict)]
+        if any(not isinstance(n,int) or isinstance(n,bool) or n<0 for n in assignments):
+            continue
+        lo,hi=max(assignments or [0]),sum(assignments)
+        n=totals.get(day)
+        if isinstance(n,bool) or not isinstance(n,int) or not lo<=n<=hi:
+            questions.append(f'{day}: quante persone uniche sono previste? Valore coerente fra {lo} e {hi}, senza duplicare persone su più attività.')
+    return list(dict.fromkeys(questions))
+
+
+def plan_identity(plan):
+    return hashlib.sha256((site_key(plan['site'])+'|'+site_key(plan['executor'])+'|'+plan['start']).encode()).hexdigest()
+
+
+def latest_weekly(records):
+    latest={}
+    for record in sorted(records,key=lambda r:(r['revision'],r['published_at'],r['id'])):
+        latest[record['plan_key']]=record
+    return list(latest.values())
+
+
+def publish_weekly(store, plan, base_id=None):
+    errors=weekly_questions(plan)
+    if errors:
+        raise ValueError('Completare il sinottico: '+'; '.join(errors[:4]))
+    ident=plan_identity(plan)
+    latest=next((x for x in latest_weekly(store.all_weekly()) if x['plan_key']==ident),None)
+    if (latest and latest['id']!=base_id) or (not latest and base_id):
+        raise ValueError('Esiste una revisione diversa. Carica l’ultima dal calendario prima di pubblicare una modifica.')
+    if latest and latest['plan']==plan:
+        return latest
+    record=dict(id=str(uuid.uuid4()),schema=WEEKLY_SCHEMA,plan_key=ident,
+                revision=latest['revision']+1 if latest else 0,
+                published_at=datetime.now(timezone.utc).isoformat(),plan=deepcopy(plan))
+    store.save_weekly(record)
+    return record
+
+
+def weekly_backup(records):
+    return json.dumps({'weekly_schema':WEEKLY_SCHEMA,'plans':records},ensure_ascii=False,indent=2,allow_nan=False).encode()
+
+
+def parse_weekly_backup(raw):
+    if len(raw)>20*1024*1024:
+        raise ValueError('Backup troppo grande.')
+    payload=json.loads(raw)
+    if not isinstance(payload,dict) or payload.get('weekly_schema')!=WEEKLY_SCHEMA or not isinstance(payload.get('plans'),list) or len(payload['plans'])>10000:
+        raise ValueError('Formato archivio settimanale non valido.')
+    results=[];seen=set()
+    for row in payload['plans']:
+        if not isinstance(row,dict) or row.get('schema')!=WEEKLY_SCHEMA:
+            raise ValueError('Revisione non valida.')
+        uuid.UUID(row['id']);datetime.fromisoformat(row['published_at'])
+        if weekly_questions(row['plan']) or row.get('plan_key')!=plan_identity(row['plan']):
+            raise ValueError('Dati pianificazione incompleti o non coerenti.')
+        if not isinstance(row.get('revision'),int) or isinstance(row['revision'],bool) or row['revision']<0 or (row['plan_key'],row['revision']) in seen:
+            raise ValueError('Numero revisione non valido o duplicato.')
+        seen.add((row['plan_key'],row['revision']));results.append(row)
+    return results
+
+
+def checklist_for_plan(plan):
+    types={t for row in plan['activities'] for t in row.get('types',[]) if t in ACTIVITY}
+    if any(x.get('hotwork')=='Sì' for x in plan['activities']):types.add('hot work')
+    if any(x.get('confined')=='Sì' for x in plan['activities']):types.add('spazi confinati')
+    sections=['Controlli generali pre-attività']+[ACTIVITY_TO_CHECKLIST[x] for x in ACTIVITY if x in types and x in ACTIVITY_TO_CHECKLIST]
+    return list(dict.fromkeys(sections))
+
+
+def parse_planning_text(text, start):
+    """Import guidato senza LLM: righe delimitate o campi etichettati; valori mancanti restano mancanti.
+    Colonne esempio: area;attivita;tipi;giorni;persone;preposto;contatto;mezzi;notturno;confinato;caldo;interferenze;interruzioni;affidataria;esecutrice;note
+    Giorni: date ISO separate da virgole. Tipi: chiavi ACTIVITY separate da virgole.
+    """
+    if len(text)>100000:raise ValueError('Testo troppo lungo (massimo 100.000 caratteri).')
+    aliases={'area':'area','area di lavoro':'area','attivita':'description','attività':'description','descrizione':'description',
+             'tipi':'types','giorni':'days_raw','persone':'people_raw','preposto':'preposto','preposto impresa':'preposto',
+             'contatto':'contact','mezzi':'equipment','mezzi d’opera':'equipment','notturno':'night','confinato':'confined',
+             'caldo':'hotwork','interferenze':'interference','interruzioni':'roadblock','affidataria':'prime','esecutrice':'executor','note':'notes'}
+    lines=text.strip().splitlines();rawrows=[]
+    if not lines:return [],['Testo vuoto.']
+    delimiter=max([';','|','\t'],key=lambda ch:lines[0].count(ch))
+    headers=next(csv.reader([lines[0]],delimiter=delimiter))
+    if sum(site_key(h) in aliases for h in headers)>=2:
+        for row in csv.DictReader(lines,delimiter=delimiter):
+            rawrows.append({aliases[site_key(k)]:v.strip() for k,v in row.items() if k and site_key(k) in aliases and isinstance(v,str)})
+    else:
+        for block in re.split(r'\n\s*\n',text):
+            row={}
+            for line in block.splitlines():
+                if ':' in line:
+                    key,value=line.split(':',1)
+                    if site_key(key) in aliases:row[aliases[site_key(key)]]=value.strip()
+            if row:rawrows.append(row)
+    rows=[];notes=[]
+    for source in rawrows[:60]:
+        row=blank_weekly_activity()
+        for key,value in source.items():
+            if key in row and key not in ['days','types']:
+                row[key]=value
+        row['types']=[x.strip().lower() for x in source.get('types','').split(',') if x.strip().lower() in ACTIVITY]
+        for key in ['night','confined','hotwork']:
+            value=site_key(row[key])
+            row[key]='Sì' if value in ['si','sì','yes'] else 'No' if value=='no' else 'Da verificare'
+        count=source.get('people_raw','').strip()
+        for day in source.get('days_raw','').split(','):
+            day=day.strip();daily_count=count
+            if '=' in day:day,daily_count=day.split('=',1)
+            try:
+                date.fromisoformat(day)
+                if daily_count.isdigit() and int(daily_count)>0:row['days'][day]=int(daily_count)
+            except ValueError:pass
+        rows.append(row)
+    if not rows:notes.append('La disposizione delle colonne non è riconosciuta: nessuna attività importata automaticamente. Usa il testo estratto come riferimento e aggiungi le schede; il tool chiederà tutti i campi mancanti.')
+    notes.append('Riconoscimento assistito: verificare tutte le schede. Date, nomi e risposte non riconosciuti non vengono inventati.')
+    return rows,notes
+
+
+def extract_pdf_grid(pdf, start):
+    """Riconosce la griglia del format negli upload successivi, non usa il PDF di riferimento."""
+    fields=['area','attivita','tipi','giorni','persone','preposto','contatto','mezzi','notturno','confinato','caldo','interferenze','interruzioni','affidataria','esecutrice','note']
+    found=[];startdate=date.fromisoformat(start)
+    for page in pdf.pages:
+        for table in page.extract_tables():
+            header_index=next((i for i,row in enumerate(table) if any('area di lavoro' in site_key(x or '') for x in row) and any('attivit' in site_key(x or '') for x in row)),None)
+            if header_index is None:continue
+            header_indices=[j for j,x in enumerate(table[header_index]) if x and x.strip()]
+            if len(header_indices)!=20:continue
+            header=[table[header_index][j] for j in header_indices]
+            dates={}
+            for j in range(10,18):
+                match=re.search(r'(\d{1,2})/(\d{1,2})',re.sub(r'\s+','',header[j] or ''))
+                if match:
+                    for year in [startdate.year-1,startdate.year,startdate.year+1]:
+                        try:
+                            day=date(year,int(match[2]),int(match[1]))
+                            if 0<=(day-startdate).days<=7:dates[j]=day.isoformat()
+                        except ValueError:pass
+            for cells in table[header_index+1:]:
+                if len(cells)<=max(header_indices):continue
+                values=[(cells[j] or '').strip() for j in header_indices]
+                if not values[1] or values[0].upper().startswith(('TOT','GUIDA')):continue
+                preposto_parts=values[18].splitlines()
+                days=[]
+                for j,day in dates.items():
+                    count=values[j].strip()
+                    if count.isdigit() and int(count)>0:days.append(day+'='+count)
+                found.append([values[0],values[1],'',','.join(days),'',preposto_parts[0] if preposto_parts else '',
+                              ' '.join(preposto_parts[1:]),values[5],values[3],values[4],values[6],values[7],values[2],values[8],values[9],values[19]])
+    if not found:return ''
+    output=StringIO();writer=csv.writer(output,delimiter=';');writer.writerow(fields);writer.writerows(found)
+    return output.getvalue()
+
+
+def extract_planning_upload(data, filename, start=None):
+    if len(data)>15*1024*1024:raise ValueError('Massimo 15 MB per documento.')
+    if filename.lower().endswith('.pdf'):
+        import pdfplumber
+        with pdfplumber.open(BytesIO(data)) as pdf:
+            if len(pdf.pages)>5:raise ValueError('Massimo 5 pagine per importazione.')
+            grid=extract_pdf_grid(pdf,start) if start else ''
+            if grid:return grid,'Griglia PDF riconosciuta: verifica date, nomi e risposte; completa le tipologie per la checklist e i campi mancanti.'
+            return '\n\n'.join(page.extract_text() or '' for page in pdf.pages), 'Testo PDF estratto; se la griglia non è riconosciuta occorre completare le schede. Per PDF scansionati carica un’immagine per usare OCR.'
+    from PIL import Image
+    import pytesseract
+    image=Image.open(BytesIO(data))
+    if image.width*image.height>20000000:raise ValueError('Immagine troppo grande: massimo 20 milioni di pixel.')
+    if image.width<2200:image=image.resize((int(image.width*2),int(image.height*2)))
+    available=pytesseract.get_languages(config='')
+    language='+'.join(x for x in ['ita','eng'] if x in available)
+    if not language:raise ValueError('Lingue OCR italiano/inglese non installate.')
+    text=pytesseract.image_to_string(image.convert('RGB'),lang=language,config='--psm 6',timeout=40)
+    return text,'OCR locale: date, nomi e colonne devono essere confermati. Le immagini sorgente non sono archiviate.'
+
+
+def plan_table_rows(plan):
+    dates=plan_dates(plan,slots=True)
+    headers=['Area di lavoro','Attività','Interruz. area/strada','Orario notturno','Spazio confinato',"Mezzi d’opera",'Lavori a caldo','Ulteriori rischi / interferenze','Affidataria','Esecutrice']
+    headers += [DAYS_IT[date.fromisoformat(day).weekday()]+'\n'+date.fromisoformat(day).strftime('%d/%m') for day in dates]
+    headers += ['Preposto impresa / contatto','Note / misure di coordinamento']
+    rows=[headers]
+    for row in plan['activities']:
+        rows.append([row['area'],row['description'],row['roadblock'],row['night'],row['confined'],row['equipment'],row['hotwork'],
+                     row['interference'],row['prime'],row['executor']]+[str(row['days'].get(day,'')) for day in dates]+
+                    [row['preposto']+'\n'+row['contact'],row['notes']])
+    rows.append(['TOT FORZA LAVORO']+['']*9+[str(plan['daily_workforce'].get(day,'')) for day in dates]+['',''])
+    return rows
+
+
+def sinottico_pdf(plan, revision=0, draft=True):
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer
+    from reportlab.lib.pagesizes import A3, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    buffer=BytesIO();width,height=landscape(A3);usable=width-72
+    doc=SimpleDocTemplate(buffer,pagesize=(width,height),leftMargin=30,rightMargin=30,topMargin=28,bottomMargin=30)
+    normal=ParagraphStyle('cell',fontName='Helvetica',fontSize=7.2,leading=9,spaceAfter=0)
+    heading=ParagraphStyle('head',parent=normal,fontName='Helvetica-Bold',alignment=TA_CENTER,fontSize=7)
+    def p(value,style=normal):return Paragraph(html.escape(str(value)).replace('\n','<br/>'),style)
+    title=Table([[p('SINOTTICO DI COORDINAMENTO ATTIVITÀ',heading),p('DAL '+plan['start'],heading),p('AL '+plan['end'],heading),p(f'Rev. {revision:02d}'+(' · BOZZA' if draft else ''),heading)]],colWidths=[usable*.45,usable*.2,usable*.2,usable*.15],hAlign='LEFT')
+    title.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),colors.HexColor('#ffbf00')),('GRID',(0,0),(-1,-1),.6,colors.grey),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('TOPPADDING',(0,0),(-1,-1),8),('BOTTOMPADDING',(0,0),(-1,-1),8)]))
+    metadata=Table([[p('Nome impresa affidataria: '+plan['prime']),p('Nome impresa esecutrice: '+plan['executor']),p('Supervisore Enel: '+plan['supervisor'])],
+                    [p('Firma C.C. affidataria: __________________\nReferente: '+plan['prime_lead']),p('Firma C.C. esecutrice: __________________\nReferente: '+plan['executor_lead']),p('Firma supervisore Enel: __________________')]],colWidths=[usable/3]*3,hAlign='LEFT')
+    metadata.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.5,colors.grey),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('TOPPADDING',(0,0),(-1,-1),9),('BOTTOMPADDING',(0,0),(-1,-1),9)]))
+    ratios=[6,18,4,3,4,9,4,8,5,5]+[2]*8+[7,11]
+    rows=plan_table_rows(plan);table=Table([[p(v,heading if i==0 else normal) for v in row] for i,row in enumerate(rows)],colWidths=[usable*x/100 for x in ratios],repeatRows=1,hAlign='LEFT')
+    styles=[('LEFTPADDING',(0,0),(-1,-1),1.5),('RIGHTPADDING',(0,0),(-1,-1),1.5),('GRID',(0,0),(-1,-1),.4,colors.HexColor('#999999')),('BACKGROUND',(0,0),(-1,0),colors.HexColor('#eeeeee')),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5),('SPAN',(0,-1),(9,-1)),('BACKGROUND',(10,-1),(17,-1),colors.HexColor('#ffbf00'))]
+    for j,day in enumerate(plan_dates(plan,slots=True),10):
+        if day>plan['end']:styles.append(('BACKGROUND',(j,0),(j,-2),colors.HexColor('#dddddd')))
+        elif date.fromisoformat(day).weekday()==6:styles.append(('BACKGROUND',(j,0),(j,-2),colors.HexColor('#ffe2e2')))
+        for i,row in enumerate(plan['activities'],1):
+            if day in row['days']:styles.append(('BACKGROUND',(j,i),(j,i),colors.HexColor('#bbd7ed')))
+    table.setStyle(TableStyle(styles))
+    guide=('GUIDA ALLA COMPILAZIONE DEL SINOTTICO\n'
+      'Indicare area, descrizione della lavorazione, interruzioni, orario notturno, spazio confinato, mezzi, lavori a caldo, ulteriori rischi e interferenze, affidataria, esecutrice e preposto reperibile. '
+      'Le celle giornaliere riportano le persone assegnate alla lavorazione; una cella vuota significa attività non prevista. '
+      'Il totale giornaliero rappresenta le persone uniche dichiarate e verificate dall’impresa, evitando duplicazioni fra attività. '
+      'La colonna oltre il periodo è fuori pianificazione. Le firme restano da apporre: la pubblicazione nel tool non equivale ad approvazione del piano o autorizzazione al lavoro.')
+    story=[p('Cantiere: '+plan['site']+' · '+plan['technology']),Spacer(1,8),title,metadata,table,Spacer(1,10),p(guide)]
+    def footer(canvas,document):
+        canvas.setFont('Helvetica',7);canvas.drawString(30,15,'HSE Risk Platform · '+('BOZZA' if draft else 'PIANIFICAZIONE INSERITA · firme da acquisire'))
+        canvas.drawRightString(width-30,15,str(document.page))
+    doc.build(story,onFirstPage=footer,onLaterPages=footer)
+    return buffer.getvalue()
+
+
+def sinottico_word(plan, revision=0, draft=True):
+    from docx.enum.section import WD_ORIENT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    doc=Document();sec=doc.sections[0];sec.orientation=WD_ORIENT.LANDSCAPE
+    sec.page_width=DocxInches(16.54);sec.page_height=DocxInches(11.69)
+    sec.left_margin=sec.right_margin=DocxInches(.4)
+    doc.styles['Normal'].font.name='Arial';doc.styles['Normal'].font.size=Pt(7)
+    doc.add_paragraph(f"Cantiere: {plan['site']} | {plan['technology']}")
+    band=doc.add_table(rows=1,cols=4);band.style='Table Grid'
+    for j,value in enumerate(['SINOTTICO DI COORDINAMENTO ATTIVITÀ','DAL '+plan['start'],'AL '+plan['end'],f'Rev. {revision:02d}'+(' · BOZZA' if draft else '')]):
+        cell=band.cell(0,j);cell.text=value
+        shade=OxmlElement('w:shd');shade.set(qn('w:fill'),'FFBF00');cell._tc.get_or_add_tcPr().append(shade)
+        for run in cell.paragraphs[0].runs:run.bold=True
+    meta=doc.add_table(rows=2,cols=3);meta.style='Table Grid'
+    for i,text in enumerate(['Nome impresa affidataria: '+plan['prime'],'Nome impresa esecutrice: '+plan['executor'],'Supervisore Enel: '+plan['supervisor']]):meta.cell(0,i).text=text
+    for i,text in enumerate(['Firma C.C. affidataria: __________\nReferente: '+plan['prime_lead'],'Firma C.C. esecutrice: __________\nReferente: '+plan['executor_lead'],'Firma supervisore Enel: __________']):meta.cell(1,i).text=text
+    rows=plan_table_rows(plan);table=doc.add_table(rows=0,cols=20);table.style='Table Grid';table.autofit=False
+    ratios=[6,18,4,3,4,9,4,8,5,5]+[2]*8+[7,11]
+    for j,ratio in enumerate(ratios):table.columns[j].width=DocxInches(15.74*ratio/100)
+    for i,values in enumerate(rows):
+        cells=table.add_row().cells
+        for j,value in enumerate(values):
+            cells[j].text=str(value);cells[j].width=DocxInches(15.74*ratios[j]/100)
+            if i in [0,len(rows)-1]:
+                shade=OxmlElement('w:shd');shade.set(qn('w:fill'),'FFBF00' if i==len(rows)-1 else 'EEEEEE');cells[j]._tc.get_or_add_tcPr().append(shade)
+        if i==0:
+            repeat=OxmlElement('w:tblHeader');table.rows[0]._tr.get_or_add_trPr().append(repeat)
+    total_cell=table.rows[-1].cells[0].merge(table.rows[-1].cells[9])
+    total_cell.text='TOT FORZA LAVORO'
+    for row in table.rows:
+        for cell in row.cells:
+            margins=OxmlElement('w:tcMar')
+            for side in ['top','left','bottom','right']:
+                item=OxmlElement('w:'+side);item.set(qn('w:w'),'40');item.set(qn('w:type'),'dxa');margins.append(item)
+            cell._tc.get_or_add_tcPr().append(margins)
+    doc.add_paragraph('GUIDA ALLA COMPILAZIONE DEL SINOTTICO')
+    doc.add_paragraph('Le celle giorno indicano persone assegnate. I totali sono persone uniche dichiarate e verificate. Firme da acquisire: inserimento nel tool non equivale ad approvazione o autorizzazione al lavoro.')
+    out=BytesIO();doc.save(out);return out.getvalue()
+
+
+def calendar_events(records, site=None, company=None):
+    events=[]
+    for record in latest_weekly(records):
+        plan=record['plan']
+        if site and site_key(plan['site'])!=site_key(site):continue
+        if company and site_key(plan['executor'])!=site_key(company):continue
+        for row in plan['activities']:
+            for day,count in row['days'].items():
+                events.append(dict(day=day,site=plan['site'],company=plan['executor'],description=row['description'],
+                                   preposto=row['preposto'],area=row['area'],people=count,task_id=row['id'],record_id=record['id']))
+    return sorted(events,key=lambda x:(x['day'],x['site'],x['company'],x['description']))
+
+
+def calendar_ics(events):
+    def escape(value):return str(value).replace('\\','\\\\').replace('\n','\\n').replace(';','\\;').replace(',','\\,').replace('\r','')
+    lines=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//HSE Risk Platform//Calendario//IT','CALSCALE:GREGORIAN']
+    for event in events:
+        day=date.fromisoformat(event['day'])
+        lines+=['BEGIN:VEVENT','UID:'+event['record_id']+'-'+event['task_id']+'-'+day.strftime('%Y%m%d')+'@hse-risk',
+                'DTSTAMP:'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'),'DTSTART;VALUE=DATE:'+day.strftime('%Y%m%d'),
+                'DTEND;VALUE=DATE:'+(day+timedelta(days=1)).strftime('%Y%m%d'),'SUMMARY:'+escape(event['description']),
+                'DESCRIPTION:'+escape('Preposto: '+event['preposto']+'\nImpresa: '+event['company']),
+                'LOCATION:'+escape(event['site']+' / '+event['area']),'END:VEVENT']
+    lines.append('END:VCALENDAR')
+    folded=[]
+    for line in lines:
+        current=''
+        for char in line:
+            if len((current+char).encode('utf-8'))>73:
+                folded.append(current);current=' '+char
+            else:current+=char
+        folded.append(current)
+    return ('\r\n'.join(folded)+'\r\n').encode('utf-8')
+
+
+def add_weekly_activity():
+    st.session_state.weekly_draft['activities'].append(blank_weekly_activity())
+    st.session_state.pop('weekly_ready',None)
+
+
+def remove_weekly_activity(uid):
+    st.session_state.weekly_draft['activities']=[x for x in st.session_state.weekly_draft['activities'] if x['id']!=uid]
+    st.session_state.pop('weekly_ready',None)
+
+
+def reset_weekly():
+    for key in list(st.session_state):
+        if key!='weekly_records' and key.startswith(('weekly_', 'wk_','import_')):del st.session_state[key]
+
+
+def load_weekly_record(record):
+    reset_weekly()
+    st.session_state.weekly_draft=deepcopy(record['plan'])
+    st.session_state.weekly_base=record['id']
+    st.session_state.weekly_base_key=record['plan_key']
+    st.session_state.weekly_revision=record['revision']
+    st.session_state.weekly_ui=uuid.uuid4().hex
+
+
+def render_company_planning(store):
+    if 'weekly_draft' not in st.session_state:st.session_state.weekly_draft=default_weekly()
+    if 'weekly_ui' not in st.session_state:st.session_state.weekly_ui=uuid.uuid4().hex
+    plan=st.session_state.weekly_draft;ui=st.session_state.weekly_ui
+    st.title('\U0001f3d7\ufe0f Pianificazione settimanale impresa')
+    st.caption('Aggiungi le attività, ottieni le verifiche preliminari e completa il sinottico prima di inserirlo nel calendario comune.')
+    if store.mode=='session':st.warning('Archivio di sessione: il calendario è comune ai due percorsi in questa sessione. Per colleghi su browser diversi serve PostgreSQL condiviso oppure un server con SQLite persistente. Esporta il backup prima di chiudere.')
+    with st.container(border=True):
+        st.subheader('\U0001f4cd 1 · Cantiere e settimana')
+        a,b=st.columns([2,1])
+        plan['site']=a.text_input('Cantiere',plan['site'],max_chars=160,key='wk_site_'+ui)
+        plan['technology']=b.selectbox('Tecnologia cantiere',['Wind','Solar','BESS'],index=['Wind','Solar','BESS'].index(plan['technology']),key='wk_tech_'+ui)
+        a,b=st.columns(2)
+        chosen=a.date_input('Inizio settimana · lunedì',date.fromisoformat(plan['start']),key='wk_start_'+ui)
+        horizon=b.radio('Orizzonte pianificazione',[7,8],index=0 if (date.fromisoformat(plan['end'])-date.fromisoformat(plan['start'])).days==6 else 1,horizontal=True,key='wk_horizon_'+ui)
+        plan['start']=chosen.isoformat();plan['end']=(chosen+timedelta(days=horizon-1)).isoformat()
+        if chosen.weekday()!=0:st.warning('Scegli un lunedì per allineare sinottico e calendario settimanale.')
+        a,b=st.columns(2)
+        plan['prime']=a.text_input('Impresa affidataria',plan['prime'],max_chars=160,key='wk_prime_'+ui)
+        plan['executor']=b.text_input('Impresa esecutrice',plan['executor'],max_chars=160,key='wk_executor_'+ui)
+        a,b,c=st.columns(3)
+        plan['prime_lead']=a.text_input('C.C. affidataria · nominativo',plan['prime_lead'],max_chars=160,key='wk_primelead_'+ui)
+        plan['executor_lead']=b.text_input('C.C. esecutrice · nominativo',plan['executor_lead'],max_chars=160,key='wk_executorlead_'+ui)
+        plan['supervisor']=c.text_input('Supervisore Enel · nominativo',plan['supervisor'],max_chars=160,key='wk_supervisor_'+ui)
+    with st.expander('\U0001f4f7 2 · Importa un sinottico da immagine, PDF o testo'):
+        st.caption('Riconoscimento locale e gratuito, senza servizi AI esterni. I risultati sono proposte da verificare; le informazioni illeggibili restano vuote e generano domande.')
+        uploaded=st.file_uploader('Documento da leggere · PNG JPG WEBP o PDF',type=['png','jpg','jpeg','webp','pdf'],key='import_file_'+ui)
+        if uploaded is not None and st.button('Estrai il testo del documento',key='import_ocr_'+ui):
+            try:
+                with st.spinner('Lettura del documento…'):
+                    extracted,warning=extract_planning_upload(uploaded.getvalue(),uploaded.name,plan['start'])
+                st.session_state['import_text_'+ui]=extracted;st.info(warning)
+            except Exception:
+                st.warning('Lettura automatica non disponibile o non riuscita. Per le immagini occorrono Tesseract e le lingue installate; puoi incollare il testo oppure compilare le schede senza OCR.')
+        st.caption('Testo strutturato: una riga per attività e intestazioni separate da punto e virgola. In alternativa blocchi con Area:, Attività:, Preposto:, ecc. I giorni devono essere date AAAA-MM-GG e persone un numero intero.')
+        st.code('area;attivita;tipi;giorni;persone;preposto;contatto;mezzi;notturno;confinato;caldo;interferenze;interruzioni;affidataria;esecutrice;note',language='text')
+        text=st.text_area('Testo da verificare e importare',height=200,key='import_text_'+ui,max_chars=100000)
+        if st.button('Prepara le schede dal testo',key='import_parse_'+ui):
+            try:
+                rows,notes=parse_planning_text(text,plan['start']);st.session_state.weekly_import=rows
+                for note in notes:st.info(note)
+            except Exception:st.error('Testo non interpretabile: verifica separatori e intestazioni, oppure usa le schede manuali.')
+        imported=st.session_state.get('weekly_import',[])
+        if imported:
+            st.dataframe(pd.DataFrame([{'Area':x['area'],'Attività':x['description'],'Preposto':x['preposto'],'Giorni riconosciuti':', '.join(x['days'])} for x in imported]),hide_index=True,width='stretch')
+            if st.button('Conferma e aggiungi queste schede alla bozza',key='import_accept_'+ui):
+                if len(plan['activities'])+len(imported)>60:st.error('Massimo 60 attività per sinottico.')
+                else:
+                    plan['activities'].extend(deepcopy(imported));st.session_state.pop('weekly_import',None);st.session_state.pop('weekly_ready',None);st.rerun()
+    st.subheader('\U0001f5c2\ufe0f 3 · Attività della settimana')
+    st.caption('Una scheda per lavorazione e preposto. Se cambiano il preposto o le condizioni operative crea una scheda distinta. I pulsanti dei giorni indicano quando è prevista la lavorazione.')
+    if not plan['activities']:st.info('Il sinottico è vuoto. Premi Aggiungi attività: nessuna riga del modello allegato è stata precaricata.')
+    for index,row in enumerate(plan['activities'],1):
+        prefix='wk_task_'+ui+'_'+row['id']
+        with st.expander(f"\U0001f3d7\ufe0f Attività {index} · {row['area'] or 'area da indicare'} · {row['description'][:60] or 'da compilare'}", expanded=index==len(plan['activities'])):
+            title,remove=st.columns([5,1]);title.markdown(f"### \U0001f3d7\ufe0f Attività {index} · {row['area'] or 'area da indicare'}")
+            remove.button('Rimuovi',icon='\U0001f5d1\ufe0f',key=prefix+'_remove',on_click=remove_weekly_activity,args=(row['id'],))
+            a,b=st.columns([1,3])
+            row['area']=a.text_input('Area di lavoro',row['area'],max_chars=160,key=prefix+'_area')
+            row['description']=b.text_area('Descrizione della lavorazione',row['description'],max_chars=1200,key=prefix+'_description')
+            row['types']=st.pills('Tipologie per la checklist',list(ACTIVITY),default=row['types'],selection_mode='multi',key=prefix+'_types')
+            a,b,c=st.columns(3)
+            row['night']=a.radio('Lavoro notturno',YES_NO,index=YES_NO.index(row['night']),key=prefix+'_night')
+            row['confined']=b.radio('Spazio confinato',YES_NO,index=YES_NO.index(row['confined']),key=prefix+'_confined')
+            row['hotwork']=c.radio('Lavori a caldo',YES_NO,index=YES_NO.index(row['hotwork']),key=prefix+'_hotwork')
+            a,b=st.columns(2)
+            row['equipment']=a.text_area('Mezzi d’opera · oppure Non previsti',row['equipment'],max_chars=1200,key=prefix+'_equipment')
+            row['interference']=b.text_area('Ulteriori rischi / interferenze · oppure Non rilevati',row['interference'],max_chars=1200,key=prefix+'_interference')
+            row['roadblock']=st.text_input('Interruzioni area / strada · oppure Non previste',row['roadblock'] if row['roadblock']!='Da verificare' else '',max_chars=300,key=prefix+'_road')
+            a,b=st.columns(2)
+            row['prime']=a.text_input('Affidataria della lavorazione',row['prime'] or plan['prime'],max_chars=160,key=prefix+'_prime')
+            row['executor']=b.text_input('Esecutrice della lavorazione',row['executor'] or plan['executor'],max_chars=160,key=prefix+'_executor')
+            a,b=st.columns(2)
+            row['preposto']=a.text_input('Preposto incaricato',row['preposto'],max_chars=160,key=prefix+'_preposto')
+            row['contact']=b.text_input('Contatto reperibile del preposto',row['contact'],max_chars=160,key=prefix+'_contact')
+            row['notes']=st.text_area('Note e misure di coordinamento',row['notes'],max_chars=1200,key=prefix+'_notes')
+            st.markdown('**\U0001f4c5 Giorni e persone assegnate**')
+            selected={}
+            for offset,day in enumerate(plan_dates(plan)):
+                a,b=st.columns([3,1]);dt=date.fromisoformat(day)
+                enabled=a.checkbox(DAYS_IT[dt.weekday()]+' '+dt.strftime('%d/%m'),value=day in row['days'],key=prefix+'_day_'+day)
+                if enabled:selected[day]=b.number_input('Persone',1,10000,int(row['days'].get(day,1)),key=prefix+'_people_'+day)
+            row['days']=selected
+    st.button('Aggiungi attività',icon='\u2795',width='stretch',on_click=add_weekly_activity,disabled=len(plan['activities'])>=60)
+    sections=checklist_for_plan(plan)
+    with st.container(border=True):
+        st.subheader('\U0001f4d1 4 · Verifiche preliminari automatiche')
+        st.caption('La checklist segue le tipologie selezionate e aggiunge i capitoli per lavori a caldo o spazi confinati quando dichiarati. Non richiede la pubblicazione del sinottico.')
+        for name in sections:st.write('\u2713 '+name)
+        if plan['activities'] and plan['site'].strip():
+            document=generate_checklist_word({'nome':plan['site'],'fase':'Pianificazione settimanale '+plan['start']},sections)
+            st.download_button('Scarica checklist preliminare Word',document.getvalue(),f"Checklist_{safe_filename(plan['site'])}_{plan['start']}.docx",icon='\U0001f4e5')
+    st.subheader('\U0001f477 5 · Forza lavoro giornaliera')
+    st.caption('Indica le persone uniche previste: la stessa persona impegnata su più attività non va contata due volte. Il totale deve essere coerente con le assegnazioni alle schede.')
+    totals={}
+    for day in plan_dates(plan):
+        assignments=[x['days'].get(day,0) for x in plan['activities']];lo=max(assignments or [0]);hi=sum(assignments)
+        value=plan['daily_workforce'].get(day,hi);value=min(hi,max(lo,value))
+        totals[day]=st.number_input(f"{DAYS_IT[date.fromisoformat(day).weekday()]} {day} · persone uniche (assegnazioni {hi})",lo,hi,int(value),key='wk_total_'+ui+'_'+day+'_'+str(lo)+'_'+str(hi))
+    plan['daily_workforce']=totals
+    st.subheader('\U0001f9fe 6 · Sinottico')
+    problems=weekly_questions(plan)
+    if problems:
+        st.warning(f'Servono {len(problems)} chiarimenti prima di completare il sinottico.')
+        for question in problems:st.write('\u2753 '+question)
+    else:st.success('Tutti i campi obbligatori sono compilati. Verifica la bozza prima dell’inserimento.')
+    if st.button('Verifica e prepara il sinottico',icon='\U0001f50e',type='primary'):
+        if problems:st.error('Completa i campi indicati nelle domande.')
+        else:
+            try:
+                rev=st.session_state.get('weekly_revision',-1)+1
+                st.session_state.weekly_ready=dict(fingerprint=hashlib.sha256(json.dumps(plan,sort_keys=True).encode()).hexdigest(),
+                    pdf=sinottico_pdf(plan,rev,True),word=sinottico_word(plan,rev,True))
+            except Exception:st.error('Generazione non riuscita. Riduci testi troppo lunghi e verifica i dati; nessuna pianificazione inserita.')
+    ready=st.session_state.get('weekly_ready')
+    fingerprint=hashlib.sha256(json.dumps(plan,sort_keys=True).encode()).hexdigest()
+    if ready and ready['fingerprint']==fingerprint and not problems:
+        a,b=st.columns(2)
+        a.download_button('Bozza sinottico PDF A3',ready['pdf'],'Sinottico_BOZZA.pdf',icon='\U0001f4c4')
+        b.download_button('Bozza sinottico Word',ready['word'],'Sinottico_BOZZA.docx',icon='\U0001f4c4')
+        confirm=st.checkbox('Confermo dati, date, preposti e totali giornalieri; inserisco il sinottico nel calendario condiviso.',key='wk_confirm_'+fingerprint)
+        if st.button('Conferma e inserisci',icon='\U0001f4be',type='primary',disabled=not confirm):
+            try:
+                base=st.session_state.get('weekly_base') if st.session_state.get('weekly_base_key')==plan_identity(plan) else None
+                inserted=publish_weekly(store,deepcopy(plan),base)
+                st.session_state.weekly_base=inserted['id'];st.session_state.weekly_base_key=inserted['plan_key'];st.session_state.weekly_revision=inserted['revision']
+                st.session_state.weekly_inserted=inserted
+                st.session_state['calendar_week']=date.fromisoformat(plan['start'])
+                st.success('Sinottico inserito: visibile nel calendario HSE Enel e HSE impresa. Nessuna firma o approvazione è stata simulata.')
+            except Exception as exc:
+                if isinstance(exc,ValueError):st.error(str(exc))
+                else:st.error('Inserimento non riuscito o revisione concorrente. Ricarica il calendario prima di riprovare. La bozza resta disponibile.')
+    elif ready:st.info('La bozza è cambiata: premi di nuovo Verifica e prepara il sinottico prima di confermare.')
+    st.caption('Non salvare scarta solo la bozza e i documenti temporanei. Le pianificazioni già inserite restano nel calendario e nell’archivio.')
+    if st.button('Non salvare la pianificazione',icon='\U0001f9ea'):
+        reset_weekly();st.rerun()
+
+
+def render_weekly_calendar(store):
+    st.title('\U0001f5d3\ufe0f Calendario condiviso delle attività')
+    st.caption('Mostra soltanto i sinottici confermati, nell’ultima revisione inserita. Le bozze non compaiono. Descrizione attività e preposto sono sempre visibili.')
+    if store.mode=='session':st.warning('Calendario di questa sessione: per sincronizzare altri browser configura un archivio comune. Puoi anche trasferire i dati con il backup settimanale.')
+    st.button('Aggiorna calendario',icon='\U0001f504')
+    records=store.all_weekly();latest=latest_weekly(records)
+    if not latest:
+        st.info('Nessuna pianificazione confermata. Il percorso HSE impresa consente di preparare il primo sinottico.')
+        return
+    a,b=st.columns(2)
+    sites=sorted({x['plan']['site'] for x in latest});site=a.selectbox('Cantiere del calendario',sites)
+    companies=sorted({x['plan']['executor'] for x in latest if site_key(x['plan']['site'])==site_key(site)})
+    company=b.selectbox('Impresa del calendario',['Tutte']+companies)
+    chosen=st.date_input('Settimana da visualizzare',date.today(),key='calendar_week')
+    start=chosen-timedelta(days=chosen.weekday());days=[(start+timedelta(days=i)).isoformat() for i in range(7)]
+    events=calendar_events(records,site,None if company=='Tutte' else company)
+    weekevents=[e for e in events if e['day'] in days]
+    parts=['<div class="week-grid">']
+    for day in days:
+        dt=date.fromisoformat(day);items=[e for e in weekevents if e['day']==day]
+        parts.append('<section class="week-day"><h4>'+DAYS_IT[dt.weekday()]+' '+dt.strftime('%d/%m')+'</h4>')
+        if not items:parts.append('<p class="muted">Nessuna attività inserita</p>')
+        for event in items:
+            parts.append('<article class="event"><strong>'+html.escape(event['description'])+'</strong><br><span>\U0001f477 '+html.escape(event['preposto'])+'</span><br><small>'+html.escape(event['company']+' · '+event['area'])+'</small></article>')
+        parts.append('</section>')
+    parts.append('</div>');st.markdown(''.join(parts),unsafe_allow_html=True)
+    st.download_button('Esporta questa settimana nel calendario ICS',calendar_ics(weekevents),f'Attivita_{start.isoformat()}.ics','text/calendar',icon='\U0001f4c5')
+    st.subheader('\U0001f4c4 Sinottici inseriti e revisioni')
+    candidates=[r for r in latest if site_key(r['plan']['site'])==site_key(site) and (company=='Tutte' or site_key(r['plan']['executor'])==site_key(company)) and r['plan']['start']<=days[-1] and r['plan']['end']>=days[0]]
+    for record in candidates:
+        p=record['plan'];uid=record['id']
+        with st.expander(f"{p['executor']} · {p['start']} / {p['end']} · Rev. {record['revision']:02d}"):
+            st.caption('Firme da acquisire. Inserimento nel calendario non equivale ad approvazione o autorizzazione al lavoro.')
+            a,b=st.columns(2)
+            a.download_button('Sinottico PDF A3',sinottico_pdf(p,record['revision'],False),f'Sinottico_{safe_filename(p["executor"])}_{p["start"]}.pdf',key='cal_pdf_'+uid)
+            b.download_button('Sinottico Word',sinottico_word(p,record['revision'],False),f'Sinottico_{safe_filename(p["executor"])}_{p["start"]}.docx',key='cal_doc_'+uid)
+            if st.session_state.get('portal_role')=='HSE impresa' and st.button('Carica per aggiornare questa pianificazione',key='cal_load_'+uid):
+                load_weekly_record(record);st.success('Pianificazione caricata: apri Attività e sinottico per modificare e inserire una nuova revisione.')
+    st.caption(f'{len(records)} revisioni conservate. Nel calendario è visibile solo l’ultima revisione di ciascuna impresa, cantiere e settimana.')
+
+
+def render_weekly_archive(store):
+    st.subheader('\U0001f5c4\ufe0f Archivio dei sinottici')
+    records=store.all_weekly();st.metric('Revisioni settimanali archiviate',len(records))
+    st.download_button('Scarica backup settimanale completo',weekly_backup(records),'HSE_sinottici_backup.json','application/json')
+    uploaded=st.file_uploader('Importa un backup settimanale',type=['json'],key='weekly_backup_file')
+    if uploaded is not None and st.button('Verifica e importa i sinottici'):
+        try:
+            incoming=parse_weekly_backup(uploaded.getvalue());store.import_weekly(incoming)
+            st.success('Backup importato. Le pianificazioni confermate sono ora disponibili nel calendario.');st.rerun()
+        except Exception:st.error('Backup non valido, revisione in conflitto o archivio non disponibile. Nessun import parziale eseguito.')
+    if store.mode=='session':st.warning('Scarica il backup prima di chiudere o ricaricare il browser. Il salvataggio di sessione non è un archivio cloud permanente.')
+
+
+def choose_portal():
+    if st.session_state.get('portal_role') in ['HSE Enel','HSE impresa']:return True
+    st.markdown('<div class="hero"><span class="eyebrow">WIND · SOLAR · BESS</span><h1>HSE Risk Platform</h1><p>Valutazioni, pianificazione e coordinamento operativo.</p></div>',unsafe_allow_html=True)
+    a,b=st.columns(2)
+    with a:
+        with st.container(border=True):
+            st.markdown('## \U0001f9ba HSE Enel');st.write('Valuta i cantieri, analizza le priorità e consulta il calendario delle imprese.')
+            if st.button('HSE Enel',type='primary',width='stretch'):st.session_state.portal_role='HSE Enel';st.rerun()
+    with b:
+        with st.container(border=True):
+            st.markdown('## \U0001f3d7\ufe0f HSE impresa');st.write('Pianifica la settimana, prepara le verifiche preliminari e inserisci il sinottico.')
+            if st.button('HSE impresa',type='primary',width='stretch'):st.session_state.portal_role='HSE impresa';st.rerun()
+    st.caption('Scegli il percorso operativo. Nessuna attività viene inserita nel calendario senza conferma esplicita.')
+    return False
+
 def main():
     st.set_page_config(page_title='HSE Risk Platform', page_icon='\U0001f9ba', layout='wide')
     st.markdown(CSS, unsafe_allow_html=True)
@@ -1374,10 +2074,19 @@ def main():
     except Exception:
         st.error('Archivio non disponibile. Controllare configurazione e collegamento. Nessun passaggio automatico a un archivio vuoto.')
         st.stop()
+    if not choose_portal():
+        return
+    role=st.session_state.portal_role
     with st.sidebar:
         st.markdown('## HSE Risk Platform')
+        st.caption('\U0001f9ba '+role)
+        if st.button('Cambia percorso',icon='↔\ufe0f'):
+            st.session_state.pop('portal_role',None);st.rerun()
+        if role=='HSE impresa':
+            company_page=st.radio('\U0001f9ed Percorso impresa',['Attività e sinottico','Calendario condiviso','Archivio settimanale'])
         st.caption('WIND · SOLAR · BESS')
-        page = st.radio('\U0001f9ed Navigazione', ['Valutazione mensile', 'Risultati e azioni', 'Storico cantiere', 'Confronto cantieri', 'Archivio e backup'], format_func=lambda label: {'Valutazione mensile':'\U0001f4dd Valutazione mensile', 'Risultati e azioni':'\U0001f3af Risultati e azioni', 'Storico cantiere':'\U0001f5d3\ufe0f Storico cantiere', 'Confronto cantieri':'\U0001f4ca Confronto cantieri', 'Archivio e backup':'\U0001f5c4\ufe0f Archivio e backup'}[label])
+        if role=='HSE Enel':
+            page = st.radio('\U0001f9ed Navigazione', ['Valutazione mensile', 'Risultati e azioni', 'Storico cantiere', 'Confronto cantieri', 'Archivio e backup', 'Calendario condiviso'], format_func=lambda label: {'Valutazione mensile':'\U0001f4dd Valutazione mensile', 'Risultati e azioni':'\U0001f3af Risultati e azioni', 'Storico cantiere':'\U0001f5d3\ufe0f Storico cantiere', 'Confronto cantieri':'\U0001f4ca Confronto cantieri', 'Archivio e backup':'\U0001f5c4\ufe0f Archivio e backup', 'Calendario condiviso':'\U0001f5d3\ufe0f Calendario condiviso'}[label])
         st.divider()
         st.caption(f'Interfaccia {UI_VERSION} · modello {MODEL_VERSION} · pesi sperimentali')
         st.caption('Periodo: un mese. Nessuna API AI. Output generati da regole esplicite.')
@@ -1385,7 +2094,14 @@ def main():
         if password and st.button('Esci'):
             st.session_state.clear()
             st.rerun()
-    if page == 'Valutazione mensile':
+    if role=='HSE impresa':
+        if company_page=='Attività e sinottico':render_company_planning(store)
+        elif company_page=='Calendario condiviso':render_weekly_calendar(store)
+        else:render_weekly_archive(store)
+        return
+    if page == 'Calendario condiviso':
+        render_weekly_calendar(store)
+    elif page == 'Valutazione mensile':
         render_form(records)
     elif page == 'Risultati e azioni':
         render_report(store, records)
@@ -1395,8 +2111,8 @@ def main():
         render_comparison(records)
     else:
         render_archive(store, records)
+        render_weekly_archive(store)
 
 
 if __name__ == '__main__':
     main()
-

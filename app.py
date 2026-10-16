@@ -1,4 +1,4 @@
-"""HSE Risk Platform 3.0 — modello gestionale trasparente, non predittivo.
+"""HSE Risk Platform 3.1 — modello gestionale trasparente, non predittivo.
 Avvio: streamlit run app.py. Tutti gli input sono riferiti al mese selezionato.
 Nessuna chiamata a modelli AI, nessuna API a pagamento.
 """
@@ -32,7 +32,7 @@ from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.shared import Pt, Inches as DocxInches
 
 MODEL_VERSION = '2.0.0'
-UI_VERSION = '3.0.0'
+UI_VERSION = '3.1.0'
 SCHEMA_VERSION = 2
 WEIGHTS = {'NC formali': 30, 'Criticità informali': 8, 'Attività': 22,
            'Interferenze': 15, 'Organizzazione': 10, 'Presidio e controlli': 15}
@@ -1429,7 +1429,7 @@ def render_archive(store, records):
 # PORTALE IMPRESA E SINOTTICO SETTIMANALE
 # Struttura ricreata dal format; nessuna riga del PDF originale è inclusa.
 # =========================================================
-WEEKLY_SCHEMA = 1
+WEEKLY_SCHEMA = 2
 DAYS_IT = ['Lun','Mar','Mer','Gio','Ven','Sab','Dom']
 YES_NO = ['Da verificare','No','Sì']
 
@@ -1443,7 +1443,7 @@ def default_weekly():
 def blank_weekly_activity():
     return dict(id=uuid.uuid4().hex,area='',description='',types=[],roadblock='Da verificare',night='Da verificare',
                 confined='Da verificare',equipment='',hotwork='Da verificare',interference='',
-                prime='',executor='',preposto='',contact='',notes='',days={})
+                prime='',executor='',preposto='',contact='',pos_ref='',notes='',days={})
 
 
 def plan_dates(plan, slots=False):
@@ -1452,7 +1452,7 @@ def plan_dates(plan, slots=False):
     return [(start+timedelta(days=i)).isoformat() for i in range(count)]
 
 
-def weekly_questions(plan):
+def weekly_questions(plan, require_pos=True):
     """Domande esplicite per ogni campo mancante; nessuna integrazione inventata."""
     questions=[]
     if not isinstance(plan,dict):
@@ -1486,6 +1486,12 @@ def weekly_questions(plan):
                 'interference':'Quali ulteriori rischi/interferenze? Scrivi Non rilevati se assenti.',
                 'prime':'Qual è l’affidataria della lavorazione?', 'executor':'Qual è l’esecutrice della lavorazione?',
                 'preposto':'Chi è il preposto della lavorazione?', 'contact':'Qual è il contatto reperibile del preposto?'}
+        if require_pos:
+            value=row.get('pos_ref','')
+            if not isinstance(value,str) or not value.strip() or len(value)>600:
+                questions.append(f'Attività {i}: qual è il riferimento POS? Inserisci un testo libero non vuoto (massimo 600 caratteri).')
+        elif 'pos_ref' in row and (not isinstance(row['pos_ref'],str) or len(row['pos_ref'])>600):
+            questions.append(f'Attività {i}: riferimento POS non valido.')
         for field,label in labels.items():
             if not isinstance(row.get(field),str) or not row[field].strip() or len(row[field])>(1200 if field in ['description','interference','equipment'] else 160):
                 questions.append(f'Attività {i}: {label}')
@@ -1556,14 +1562,14 @@ def parse_weekly_backup(raw):
     if len(raw)>20*1024*1024:
         raise ValueError('Backup troppo grande.')
     payload=json.loads(raw)
-    if not isinstance(payload,dict) or payload.get('weekly_schema')!=WEEKLY_SCHEMA or not isinstance(payload.get('plans'),list) or len(payload['plans'])>10000:
+    if not isinstance(payload,dict) or payload.get('weekly_schema') not in [1,WEEKLY_SCHEMA] or not isinstance(payload.get('plans'),list) or len(payload['plans'])>10000:
         raise ValueError('Formato archivio settimanale non valido.')
     results=[];seen=set()
     for row in payload['plans']:
-        if not isinstance(row,dict) or row.get('schema')!=WEEKLY_SCHEMA:
+        if not isinstance(row,dict) or row.get('schema') not in [1,WEEKLY_SCHEMA]:
             raise ValueError('Revisione non valida.')
         uuid.UUID(row['id']);datetime.fromisoformat(row['published_at'])
-        if weekly_questions(row['plan']) or row.get('plan_key')!=plan_identity(row['plan']):
+        if weekly_questions(row['plan'],require_pos=row['schema']>=2) or row.get('plan_key')!=plan_identity(row['plan']):
             raise ValueError('Dati pianificazione incompleti o non coerenti.')
         if not isinstance(row.get('revision'),int) or isinstance(row['revision'],bool) or row['revision']<0 or (row['plan_key'],row['revision']) in seen:
             raise ValueError('Numero revisione non valido o duplicato.')
@@ -1581,20 +1587,20 @@ def checklist_for_plan(plan):
 
 def parse_planning_text(text, start):
     """Import guidato senza LLM: righe delimitate o campi etichettati; valori mancanti restano mancanti.
-    Colonne esempio: area;attivita;tipi;giorni;persone;preposto;contatto;mezzi;notturno;confinato;caldo;interferenze;interruzioni;affidataria;esecutrice;note
+    Colonne esempio: area;attivita;tipi;giorni;persone;preposto;contatto;mezzi;notturno;confinato;caldo;interferenze;interruzioni;affidataria;esecutrice;riferimento_pos;note
     Giorni: date ISO separate da virgole. Tipi: chiavi ACTIVITY separate da virgole.
     """
     if len(text)>100000:raise ValueError('Testo troppo lungo (massimo 100.000 caratteri).')
     aliases={'area':'area','area di lavoro':'area','attivita':'description','attività':'description','descrizione':'description',
              'tipi':'types','giorni':'days_raw','persone':'people_raw','preposto':'preposto','preposto impresa':'preposto',
              'contatto':'contact','mezzi':'equipment','mezzi d’opera':'equipment','notturno':'night','confinato':'confined',
-             'caldo':'hotwork','interferenze':'interference','interruzioni':'roadblock','affidataria':'prime','esecutrice':'executor','note':'notes'}
+             'caldo':'hotwork','interferenze':'interference','interruzioni':'roadblock','affidataria':'prime','esecutrice':'executor','note':'notes','riferimento pos':'pos_ref','riferimento_pos':'pos_ref','pos':'pos_ref','pos_ref':'pos_ref'}
     lines=text.strip().splitlines();rawrows=[]
     if not lines:return [],['Testo vuoto.']
     delimiter=max([';','|','\t'],key=lambda ch:lines[0].count(ch))
     headers=next(csv.reader([lines[0]],delimiter=delimiter))
     if sum(site_key(h) in aliases for h in headers)>=2:
-        for row in csv.DictReader(lines,delimiter=delimiter):
+        for row in csv.DictReader(StringIO(text.strip()),delimiter=delimiter):
             rawrows.append({aliases[site_key(k)]:v.strip() for k,v in row.items() if k and site_key(k) in aliases and isinstance(v,str)})
     else:
         for block in re.split(r'\n\s*\n',text):
@@ -1630,14 +1636,15 @@ def parse_planning_text(text, start):
 
 def extract_pdf_grid(pdf, start):
     """Riconosce la griglia del format negli upload successivi, non usa il PDF di riferimento."""
-    fields=['area','attivita','tipi','giorni','persone','preposto','contatto','mezzi','notturno','confinato','caldo','interferenze','interruzioni','affidataria','esecutrice','note']
+    fields=['area','attivita','tipi','giorni','persone','preposto','contatto','mezzi','notturno','confinato','caldo','interferenze','interruzioni','affidataria','esecutrice','riferimento_pos','note']
     found=[];startdate=date.fromisoformat(start)
     for page in pdf.pages:
         for table in page.extract_tables():
             header_index=next((i for i,row in enumerate(table) if any('area di lavoro' in site_key(x or '') for x in row) and any('attivit' in site_key(x or '') for x in row)),None)
             if header_index is None:continue
             header_indices=[j for j,x in enumerate(table[header_index]) if x and x.strip()]
-            if len(header_indices)!=20:continue
+            if len(header_indices) not in [20,21]:continue
+            has_pos=len(header_indices)==21
             header=[table[header_index][j] for j in header_indices]
             dates={}
             for j in range(10,18):
@@ -1658,7 +1665,7 @@ def extract_pdf_grid(pdf, start):
                     count=values[j].strip()
                     if count.isdigit() and int(count)>0:days.append(day+'='+count)
                 found.append([values[0],values[1],'',','.join(days),'',preposto_parts[0] if preposto_parts else '',
-                              ' '.join(preposto_parts[1:]),values[5],values[3],values[4],values[6],values[7],values[2],values[8],values[9],values[19]])
+                              ' '.join(preposto_parts[1:]),values[5],values[3],values[4],values[6],values[7],values[2],values[8],values[9],(' '.join(values[19].split()) if ' '.join(values[19].split())!='Da integrare (piano precedente)' else '') if has_pos else '',values[20] if has_pos else values[19]])
     if not found:return ''
     output=StringIO();writer=csv.writer(output,delimiter=';');writer.writerow(fields);writer.writerows(found)
     return output.getvalue()
@@ -1689,13 +1696,13 @@ def plan_table_rows(plan):
     dates=plan_dates(plan,slots=True)
     headers=['Area di lavoro','Attività','Interruz. area/strada','Orario notturno','Spazio confinato',"Mezzi d’opera",'Lavori a caldo','Ulteriori rischi / interferenze','Affidataria','Esecutrice']
     headers += [DAYS_IT[date.fromisoformat(day).weekday()]+'\n'+date.fromisoformat(day).strftime('%d/%m') for day in dates]
-    headers += ['Preposto impresa / contatto','Note / misure di coordinamento']
+    headers += ['Preposto impresa / contatto','Riferimento POS','Note / misure di coordinamento']
     rows=[headers]
     for row in plan['activities']:
         rows.append([row['area'],row['description'],row['roadblock'],row['night'],row['confined'],row['equipment'],row['hotwork'],
                      row['interference'],row['prime'],row['executor']]+[str(row['days'].get(day,'')) for day in dates]+
-                    [row['preposto']+'\n'+row['contact'],row['notes']])
-    rows.append(['TOT FORZA LAVORO']+['']*9+[str(plan['daily_workforce'].get(day,'')) for day in dates]+['',''])
+                    [row['preposto']+'\n'+row['contact'],row.get('pos_ref','').strip() or 'Da integrare (piano precedente)',row['notes']])
+    rows.append(['TOT FORZA LAVORO']+['']*9+[str(plan['daily_workforce'].get(day,'')) for day in dates]+['','',''])
     return rows
 
 
@@ -1715,7 +1722,7 @@ def sinottico_pdf(plan, revision=0, draft=True):
     metadata=Table([[p('Nome impresa affidataria: '+plan['prime']),p('Nome impresa esecutrice: '+plan['executor']),p('Supervisore Enel: '+plan['supervisor'])],
                     [p('Firma C.C. affidataria: __________________\nReferente: '+plan['prime_lead']),p('Firma C.C. esecutrice: __________________\nReferente: '+plan['executor_lead']),p('Firma supervisore Enel: __________________')]],colWidths=[usable/3]*3,hAlign='LEFT')
     metadata.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.5,colors.grey),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('TOPPADDING',(0,0),(-1,-1),9),('BOTTOMPADDING',(0,0),(-1,-1),9)]))
-    ratios=[6,18,4,3,4,9,4,8,5,5]+[2]*8+[7,11]
+    ratios=[6,16,4,3,4,8,4,7,5,5]+[2]*8+[7,7,8]
     rows=plan_table_rows(plan);table=Table([[p(v,heading if i==0 else normal) for v in row] for i,row in enumerate(rows)],colWidths=[usable*x/100 for x in ratios],repeatRows=1,hAlign='LEFT')
     styles=[('LEFTPADDING',(0,0),(-1,-1),1.5),('RIGHTPADDING',(0,0),(-1,-1),1.5),('GRID',(0,0),(-1,-1),.4,colors.HexColor('#999999')),('BACKGROUND',(0,0),(-1,0),colors.HexColor('#eeeeee')),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('TOPPADDING',(0,0),(-1,-1),5),('BOTTOMPADDING',(0,0),(-1,-1),5),('SPAN',(0,-1),(9,-1)),('BACKGROUND',(10,-1),(17,-1),colors.HexColor('#ffbf00'))]
     for j,day in enumerate(plan_dates(plan,slots=True),10):
@@ -1725,7 +1732,7 @@ def sinottico_pdf(plan, revision=0, draft=True):
             if day in row['days']:styles.append(('BACKGROUND',(j,i),(j,i),colors.HexColor('#bbd7ed')))
     table.setStyle(TableStyle(styles))
     guide=('GUIDA ALLA COMPILAZIONE DEL SINOTTICO\n'
-      'Indicare area, descrizione della lavorazione, interruzioni, orario notturno, spazio confinato, mezzi, lavori a caldo, ulteriori rischi e interferenze, affidataria, esecutrice e preposto reperibile. '
+      'Indicare area, descrizione della lavorazione, interruzioni, orario notturno, spazio confinato, mezzi, lavori a caldo, ulteriori rischi e interferenze, affidataria, esecutrice, preposto reperibile e riferimento POS per ogni attività. '
       'Le celle giornaliere riportano le persone assegnate alla lavorazione; una cella vuota significa attività non prevista. '
       'Il totale giornaliero rappresenta le persone uniche dichiarate e verificate dall’impresa, evitando duplicazioni fra attività. '
       'La colonna oltre il periodo è fuori pianificazione. Le firme restano da apporre: la pubblicazione nel tool non equivale ad approvazione del piano o autorizzazione al lavoro.')
@@ -1754,8 +1761,8 @@ def sinottico_word(plan, revision=0, draft=True):
     meta=doc.add_table(rows=2,cols=3);meta.style='Table Grid'
     for i,text in enumerate(['Nome impresa affidataria: '+plan['prime'],'Nome impresa esecutrice: '+plan['executor'],'Supervisore Enel: '+plan['supervisor']]):meta.cell(0,i).text=text
     for i,text in enumerate(['Firma C.C. affidataria: __________\nReferente: '+plan['prime_lead'],'Firma C.C. esecutrice: __________\nReferente: '+plan['executor_lead'],'Firma supervisore Enel: __________']):meta.cell(1,i).text=text
-    rows=plan_table_rows(plan);table=doc.add_table(rows=0,cols=20);table.style='Table Grid';table.autofit=False
-    ratios=[6,18,4,3,4,9,4,8,5,5]+[2]*8+[7,11]
+    rows=plan_table_rows(plan);table=doc.add_table(rows=0,cols=21);table.style='Table Grid';table.autofit=False
+    ratios=[6,16,4,3,4,8,4,7,5,5]+[2]*8+[7,7,8]
     for j,ratio in enumerate(ratios):table.columns[j].width=DocxInches(15.74*ratio/100)
     for i,values in enumerate(rows):
         cells=table.add_row().cells
@@ -1774,7 +1781,7 @@ def sinottico_word(plan, revision=0, draft=True):
                 item=OxmlElement('w:'+side);item.set(qn('w:w'),'40');item.set(qn('w:type'),'dxa');margins.append(item)
             cell._tc.get_or_add_tcPr().append(margins)
     doc.add_paragraph('GUIDA ALLA COMPILAZIONE DEL SINOTTICO')
-    doc.add_paragraph('Le celle giorno indicano persone assegnate. I totali sono persone uniche dichiarate e verificate. Firme da acquisire: inserimento nel tool non equivale ad approvazione o autorizzazione al lavoro.')
+    doc.add_paragraph('Riferimento POS: testo libero obbligatorio per ogni attività; indicare il documento e le parti pertinenti. Le celle giorno indicano persone assegnate. I totali sono persone uniche dichiarate e verificate. Firme da acquisire: inserimento nel tool non equivale ad approvazione o autorizzazione al lavoro.')
     out=BytesIO();doc.save(out);return out.getvalue()
 
 
@@ -1872,7 +1879,7 @@ def render_company_planning(store):
             except Exception:
                 st.warning('Lettura automatica non disponibile o non riuscita. Per le immagini occorrono Tesseract e le lingue installate; puoi incollare il testo oppure compilare le schede senza OCR.')
         st.caption('Testo strutturato: una riga per attività e intestazioni separate da punto e virgola. In alternativa blocchi con Area:, Attività:, Preposto:, ecc. I giorni devono essere date AAAA-MM-GG e persone un numero intero.')
-        st.code('area;attivita;tipi;giorni;persone;preposto;contatto;mezzi;notturno;confinato;caldo;interferenze;interruzioni;affidataria;esecutrice;note',language='text')
+        st.code('area;attivita;tipi;giorni;persone;preposto;contatto;mezzi;notturno;confinato;caldo;interferenze;interruzioni;affidataria;esecutrice;riferimento_pos;note',language='text')
         text=st.text_area('Testo da verificare e importare',height=200,key='import_text_'+ui,max_chars=100000)
         if st.button('Prepara le schede dal testo',key='import_parse_'+ui):
             try:
@@ -1881,7 +1888,7 @@ def render_company_planning(store):
             except Exception:st.error('Testo non interpretabile: verifica separatori e intestazioni, oppure usa le schede manuali.')
         imported=st.session_state.get('weekly_import',[])
         if imported:
-            st.dataframe(pd.DataFrame([{'Area':x['area'],'Attività':x['description'],'Preposto':x['preposto'],'Giorni riconosciuti':', '.join(x['days'])} for x in imported]),hide_index=True,width='stretch')
+            st.dataframe(pd.DataFrame([{'Area':x['area'],'Attività':x['description'],'Preposto':x['preposto'],'Riferimento POS':x.get('pos_ref',''),'Giorni riconosciuti':', '.join(x['days'])} for x in imported]),hide_index=True,width='stretch')
             if st.button('Conferma e aggiungi queste schede alla bozza',key='import_accept_'+ui):
                 if len(plan['activities'])+len(imported)>60:st.error('Massimo 60 attività per sinottico.')
                 else:
@@ -1912,6 +1919,8 @@ def render_company_planning(store):
             a,b=st.columns(2)
             row['preposto']=a.text_input('Preposto incaricato',row['preposto'],max_chars=160,key=prefix+'_preposto')
             row['contact']=b.text_input('Contatto reperibile del preposto',row['contact'],max_chars=160,key=prefix+'_contact')
+            row['pos_ref']=st.text_area('Riferimento POS · obbligatorio',row.get('pos_ref',''),max_chars=600,key=prefix+'_pos_ref',
+                help='Testo libero: indica il POS pertinente alla lavorazione, ad esempio titolo/impresa, revisione e paragrafo o scheda. Il tool non verifica il documento citato.')
             row['notes']=st.text_area('Note e misure di coordinamento',row['notes'],max_chars=1200,key=prefix+'_notes')
             st.markdown('**\U0001f4c5 Giorni e persone assegnate**')
             selected={}
@@ -2007,6 +2016,8 @@ def render_weekly_calendar(store):
     for record in candidates:
         p=record['plan'];uid=record['id']
         with st.expander(f"{p['executor']} · {p['start']} / {p['end']} · Rev. {record['revision']:02d}"):
+            if any(not str(x.get('pos_ref','')).strip() for x in p['activities']):
+                st.warning('Pianificazione precedente senza riferimento POS: lo storico è conservato. Caricala per aggiornare e integra il riferimento POS di ogni attività prima della nuova conferma.')
             st.caption('Firme da acquisire. Inserimento nel calendario non equivale ad approvazione o autorizzazione al lavoro.')
             a,b=st.columns(2)
             a.download_button('Sinottico PDF A3',sinottico_pdf(p,record['revision'],False),f'Sinottico_{safe_filename(p["executor"])}_{p["start"]}.pdf',key='cal_pdf_'+uid)
@@ -2019,6 +2030,7 @@ def render_weekly_calendar(store):
 def render_weekly_archive(store):
     st.subheader('\U0001f5c4\ufe0f Archivio dei sinottici')
     records=store.all_weekly();st.metric('Revisioni settimanali archiviate',len(records))
+    st.caption('I backup precedenti restano importabili. I riferimenti POS mancanti si completano caricando la pianificazione per una nuova revisione; lo storico originale non viene modificato.')
     st.download_button('Scarica backup settimanale completo',weekly_backup(records),'HSE_sinottici_backup.json','application/json')
     uploaded=st.file_uploader('Importa un backup settimanale',type=['json'],key='weekly_backup_file')
     if uploaded is not None and st.button('Verifica e importa i sinottici'):

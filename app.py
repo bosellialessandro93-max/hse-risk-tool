@@ -1,1940 +1,640 @@
+"""HSE Risk Platform 2.0 — modello gestionale trasparente, non predittivo.
+Avvio: streamlit run app.py. Tutti gli input sono riferiti al mese selezionato.
+Nessuna chiamata a modelli AI, nessuna API a pagamento.
+"""
+from __future__ import annotations
 from io import BytesIO
-from datetime import datetime
-
-import altair as alt
+from datetime import datetime, date, timezone
+from pathlib import Path
+from copy import deepcopy
+import calendar
+import hmac
+import json
+import math
+import os
+import re
+import sqlite3
+import unicodedata
+import uuid
+import textwrap
 import pandas as pd
+import altair as alt
 import streamlit as st
 from pptx import Presentation
-from pptx.util import Inches
+from pptx.util import Inches, Pt as PptPt
+from pptx.dml.color import RGBColor
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.shared import Pt, Inches as DocxInches
 
-
-# =========================================================
-# CONFIGURAZIONE STREAMLIT
-# =========================================================
-st.set_page_config(
-    page_title="HSE Risk Platform AI Locale",
-    page_icon="🦺",
-    layout="wide"
-)
-
-
-# =========================================================
-# PARAMETRI DEL MODELLO
-# =========================================================
-
-# Gravità NC ridotte a tre livelli
-NC_SEVERITY_WEIGHTS = {
-    "bassa": 3,
-    "media": 8,
-    "alta": 16
-}
-
-NC_THEME_WEIGHTS = {
-    "elettrico": 16,
-    "scavi": 16,
-    "quota": 14,
-    "sollevamento": 14,
-    "spazi confinati": 18,
-    "incendio": 14,
-    "viabilità": 10,
-    "dpi": 7,
-    "ordine e pulizia": 6,
-    "documentale": 5,
-    "ambientale": 8,
-    "altro": 6
-}
-
-ACTIVITY_WEIGHTS = {
-    "elettrici": 18,
-    "scavi": 18,
-    "lavori in quota": 16,
-    "sollevamenti": 16,
-    "spazi confinati": 20,
-    "hot work": 15,
-    "movimentazione mezzi": 12,
-    "civili": 8,
-    "meccanici": 10,
-    "altro": 6
-}
-
-AWARENESS_BONUS = {
-    "rischio elettrico": 8,
-    "scavi e sottoservizi": 8,
-    "lavori in quota": 7,
-    "sollevamenti": 7,
-    "spazi confinati": 9,
-    "hot work / incendio": 7,
-    "viabilità e mezzi": 6,
-    "dpi": 4,
-    "ordine e pulizia": 4,
-    "toolbox generale": 3,
-    "altro": 2
-}
-
-LINKS_ACTIVITY_NC = {
-    "elettrici": ["elettrico"],
-    "scavi": ["scavi"],
-    "lavori in quota": ["quota"],
-    "sollevamenti": ["sollevamento"],
-    "spazi confinati": ["spazi confinati"],
-    "hot work": ["incendio"],
-    "movimentazione mezzi": ["viabilità"]
-}
-
-LINKS_AWARENESS_ACTIVITY = {
-    "rischio elettrico": ["elettrici"],
-    "scavi e sottoservizi": ["scavi"],
-    "lavori in quota": ["lavori in quota"],
-    "sollevamenti": ["sollevamenti"],
-    "spazi confinati": ["spazi confinati"],
-    "hot work / incendio": ["hot work"],
-    "viabilità e mezzi": ["movimentazione mezzi"],
-    "dpi": ["civili", "meccanici", "elettrici", "scavi"],
-    "ordine e pulizia": ["civili", "meccanici"]
-}
+MODEL_VERSION = '2.0.0'
+SCHEMA_VERSION = 2
+WEIGHTS = {'NC formali': 30, 'Criticità informali': 8, 'Attività': 22,
+           'Interferenze': 15, 'Organizzazione': 10, 'Presidio e controlli': 15}
+THEMES = ['elettrico', 'scavi', 'quota', 'sollevamento', 'spazi confinati',
+          'incendio', 'viabilità', 'dpi', 'ordine e pulizia', 'documentale', 'ambientale', 'altro']
+THEME_FACTOR = dict(zip(THEMES, [1.2, 1.2, 1.15, 1.15, 1.25, 1.15, 1.05, .85, .7, .65, 1., .85]))
+SEVERITY = {'bassa': 1., 'media': 2.5, 'alta': 5.}
+STATUS = {'Aperta': 1., 'Chiusa nei tempi': .2, 'Chiusa in ritardo': .4}
+ACTIVITY = {'elettrici': 80, 'scavi': 75, 'lavori in quota': 85, 'sollevamenti': 80,
+            'spazi confinati': 95, 'hot work': 75, 'movimentazione mezzi': 55,
+            'civili': 35, 'meccanici': 45, 'altro': 40}
+ACTIVITY_THEME = {'elettrici': 'elettrico', 'scavi': 'scavi', 'lavori in quota': 'quota',
+                  'sollevamenti': 'sollevamento', 'spazi confinati': 'spazi confinati',
+                  'hot work': 'incendio', 'movimentazione mezzi': 'viabilità',
+                  'civili': 'ordine e pulizia', 'meccanici': 'dpi', 'altro': 'altro'}
+PHASE_THEMES = {'cantierizzazione': ['scavi', 'viabilità', 'ordine e pulizia'],
+                'costruzione': ['quota', 'sollevamento', 'dpi'],
+                'commissioning': ['elettrico', 'incendio', 'dpi'],
+                'punch list': ['elettrico', 'quota', 'ordine e pulizia']}
+COLORS = ['#16826b', '#4b8b9e', '#b38212', '#d46b22', '#b83246']
 
 
-# La fase non genera più un malus diretto sul Risk Index.
-# Viene però utilizzata per verificare la coerenza delle
-# sensibilizzazioni con il momento operativo del cantiere.
-LINKS_PHASE_AWARENESS = {
-    "cantierizzazione": [
-        "scavi e sottoservizi",
-        "viabilità e mezzi",
-        "ordine e pulizia",
-        "toolbox generale"
-    ],
-    "costruzione": [
-        "lavori in quota",
-        "sollevamenti",
-        "dpi",
-        "ordine e pulizia",
-        "toolbox generale"
-    ],
-    "commissioning": [
-        "rischio elettrico",
-        "hot work / incendio",
-        "dpi",
-        "toolbox generale"
-    ],
-    "punch list": [
-        "rischio elettrico",
-        "lavori in quota",
-        "ordine e pulizia",
-        "dpi",
-        "toolbox generale"
-    ]
-}
-
-STOP_WORK_BONUS_PER_EVENT = 1.5
-STOP_WORK_BONUS_CAP = 6.0
-PHASE_AWARENESS_BONUS_PER_MATCH = 2
-PHASE_AWARENESS_BONUS_CAP = 6
+def bounded(x, low=0., high=100.):
+    return max(low, min(high, float(x)))
 
 
-# =========================================================
-# FUNZIONI GENERALI
-# =========================================================
-def normalize_list(values):
-    return [
-        value.strip().lower()
-        for value in values
-        if value and value.strip()
-    ]
+def risk_level(x):
+    return ['Basso', 'Medio basso', 'Medio', 'Alto', 'Critico'][min(4, max(0, math.ceil(x / 20) - 1))]
 
 
-def risk_level(risk):
-    if risk <= 20:
-        return "Basso"
-    if risk <= 40:
-        return "Medio basso"
-    if risk <= 60:
-        return "Medio"
-    if risk <= 80:
-        return "Alto"
-    return "Critico"
+def site_key(name):
+    return ' '.join(unicodedata.normalize('NFKC', name).casefold().split())
 
 
-def safe_filename(value):
-    return (
-        value.strip()
-        .replace(" ", "_")
-        .replace("/", "_")
-        .replace("\\", "_")
-    )
+def safe_filename(name):
+    return re.sub(r'[^\w.-]+', '_', name, flags=re.UNICODE).strip('_')[:90] or 'cantiere'
 
 
-# =========================================================
-# INTERFERENZA ATTIVITÀ
-# =========================================================
-def calculate_interference_score(
-    interference_level,
-    activities
-):
+def default_data():
+    today = date.today().replace(day=1)
+    last_month = date(today.year - (today.month == 1), 12 if today.month == 1 else today.month - 1, 1)
+    return dict(nome='', technology='Wind', fase='costruzione', month=last_month.isoformat()[:7],
+                app=1, sub=0, company_hse=1, hse_coverage=80., inspections=0,
+                inspection_target=4, activities=['civili'], interference_level=3,
+                nc_items=[], crit_items=[], awareness=[], stop_positive=0, stop_negative=0,
+                imminent_danger=False, hours=None, workers=None, days=None, notes='')
+
+
+def validate_data(d):
+    errors = []
+    if not isinstance(d, dict):
+        return ['Valutazione non valida.']
+    if not isinstance(d.get('nome'), str) or not d['nome'].strip() or len(d['nome']) > 120:
+        errors.append('Inserire un nome cantiere (massimo 120 caratteri).')
+    try:
+        month = datetime.strptime(d.get('month', ''), '%Y-%m')
+        if month.strftime('%Y-%m') != d['month'] or month.date() > date.today().replace(day=1):
+            errors.append('Il mese deve essere valido e non futuro.')
+    except (TypeError, ValueError):
+        errors.append('Mese non valido: usare AAAA-MM.')
+    if d.get('technology') not in ['Wind', 'Solar', 'BESS'] or d.get('fase') not in PHASE_THEMES:
+        errors.append('Tecnologia o fase non valida.')
+    ranges = {'app': (0, 200), 'sub': (0, 200), 'company_hse': (0, 200),
+              'hse_coverage': (0, 100), 'inspections': (0, 2000), 'inspection_target': (1, 1000),
+              'interference_level': (1, 10), 'stop_positive': (0, 1000), 'stop_negative': (0, 1000)}
+    for key, (lo, hi) in ranges.items():
+        v = d.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not lo <= v <= hi:
+            errors.append(f'Valore non valido: {key}.')
+        elif key not in ['hse_coverage'] and int(v) != v:
+            errors.append(f'{key}: usare un numero intero.')
+    for key, hi in [('hours', 10000000), ('workers', 100000), ('days', 31)]:
+        v = d.get(key)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 < v <= hi):
+            errors.append(f'{key}: inserire un valore positivo oppure lasciare il dato non disponibile.')
+    if d.get('days') and isinstance(d['days'], (int, float)):
+        try:
+            if d['days'] > calendar.monthrange(month.year, month.month)[1]:
+                errors.append('Giorni di attività superiori ai giorni del mese.')
+        except UnboundLocalError:
+            pass
+    activities = d.get('activities', [])
+    if not isinstance(activities, list) or not activities or any(a not in ACTIVITY for a in activities):
+        errors.append('Selezionare almeno una attività valida.')
+    elif len(activities) != len(set(activities)):
+        errors.append('Attività duplicate.')
+    for kind in ['nc_items', 'crit_items']:
+        rows = d.get(kind)
+        if not isinstance(rows, list) or len(rows) > 1000:
+            errors.append(f'Elenco {kind} non valido (massimo 1000 righe).')
+            continue
+        for i, row in enumerate(rows):
+            if not isinstance(row, dict):
+                errors.append(f'{kind}, riga {i+1}: formato errato.')
+                continue
+            if row.get('theme') not in THEMES or row.get('severity') not in SEVERITY or row.get('status') not in STATUS:
+                errors.append(f'{kind}, riga {i+1}: completare tema, gravità e stato.')
+            for key in ['late', 'repeat']:
+                if not isinstance(row.get(key), bool):
+                    errors.append(f'{kind}, riga {i+1}: {key} non valido.')
+            if row.get('late') and row.get('status') != 'Aperta':
+                errors.append(f'{kind}, riga {i+1}: scaduta si usa solo per una anomalia aperta.')
+            if not isinstance(row.get('note', ''), str) or len(row.get('note', '')) > 1000:
+                errors.append(f'{kind}, riga {i+1}: nota troppo lunga.')
+    rows = d.get('awareness')
+    if not isinstance(rows, list) or len(rows) > 500:
+        errors.append('Elenco sensibilizzazioni non valido.')
+    else:
+        topics = []
+        for i, row in enumerate(rows):
+            if not isinstance(row, dict):
+                errors.append('Sensibilizzazione non valida.')
+                continue
+            topics.append(row.get('theme'))
+            count, reach = row.get('count'), row.get('coverage')
+            if row.get('theme') not in THEMES or isinstance(count, bool) or not isinstance(count, (int, float)) or not math.isfinite(count) or count < 1 or count > 1000 or int(count) != count:
+                errors.append(f'Sensibilizzazione {i+1}: tema o numero incontri non valido.')
+            if reach is not None and (isinstance(reach, bool) or not isinstance(reach, (int, float)) or not math.isfinite(reach) or not 0 <= reach <= 100):
+                errors.append(f'Sensibilizzazione {i+1}: copertura deve essere tra 0 e 100 oppure vuota.')
+        if len(topics) != len(set(topics)):
+            errors.append('Usare una sola riga per tema di sensibilizzazione, sommando gli incontri.')
+    if not isinstance(d.get('imminent_danger'), bool):
+        errors.append('Indicazione pericolo attuale non valida.')
+    if not isinstance(d.get('notes', ''), str) or len(d.get('notes', '')) > 5000:
+        errors.append('Note generali non valide (massimo 5000 caratteri).')
+    if not errors and d['app'] + d['sub'] == 0:
+        errors.append('Indicare almeno una impresa operativa.')
+    return list(dict.fromkeys(errors))
+
+
+def anomaly_load(rows):
+    return sum(SEVERITY[r['severity']] * THEME_FACTOR[r['theme']] * STATUS[r['status']]
+               * (1.25 if r['late'] else 1) * (1.2 if r['repeat'] else 1) for r in rows)
+
+
+def topic_needs(d):
+    needs, reasons = {}, {}
+    for activity in d['activities']:
+        theme = ACTIVITY_THEME[activity]
+        needs[theme] = max(needs.get(theme, 0), ACTIVITY[activity] / 100)
+        reasons.setdefault(theme, []).append('attività: ' + activity)
+    for field, label, factor in [('nc_items', 'NC formale', 1.), ('crit_items', 'criticità informale', .5)]:
+        for row in d[field]:
+            if row['status'] == 'Aperta':
+                theme = row['theme']
+                needs[theme] = needs.get(theme, 0) + SEVERITY[row['severity']] / 5 * factor
+                reasons.setdefault(theme, []).append(f"{label} aperta, gravità {row['severity']}")
+    for theme in PHASE_THEMES[d['fase']]:
+        needs[theme] = max(needs.get(theme, 0), .2)
+        reasons.setdefault(theme, []).append('coerenza con fase ' + d['fase'])
+    return needs, reasons
+
+
+def calculate_risk(d):
+    """Pesi ipotetici di policy, versionati. Nessuna stima statistica degli infortuni.
+    Indice base sempre confrontabile; contesto opzionale separato.
     """
-    Il livello di interferenza è impostato dall'utilizzatore da 1 a 10.
-
-    Il risultato è corretto in funzione di:
-    - pericolosità dell'attività più critica;
-    - numero delle attività contemporanee.
-
-    Livello 1 = impatto minimo.
-    Livello 10 = impatto massimo.
-    """
-
-    if not activities:
-        return 0, 0, 1
-
-    highest_activity_weight = max(
-        ACTIVITY_WEIGHTS.get(activity, 6)
-        for activity in activities
-    )
-
-    # Fattore compreso indicativamente tra 0,30 e 1
-    activity_criticality_factor = (
-        highest_activity_weight /
-        max(ACTIVITY_WEIGHTS.values())
-    )
-
-    # Aumento fino al 25% in presenza di più attività
-    activity_count_factor = min(
-        1 + max(0, len(activities) - 1) * 0.08,
-        1.25
-    )
-
-    normalized_level = (interference_level - 1) / 9
-
-    interference_score = (
-        normalized_level
-        * 100
-        * activity_criticality_factor
-        * activity_count_factor
-    )
-
-    interference_score = min(
-        round(interference_score, 1),
-        100
-    )
-
-    return (
-        interference_score,
-        round(activity_criticality_factor, 2),
-        round(activity_count_factor, 2)
-    )
-
-
-# =========================================================
-# COPERTURA HSE IMPRESE
-# =========================================================
-def calculate_hse_coverage(
-    contractors,
-    company_hse
-):
-    """
-    Confronta il numero di HSE delle imprese con gli appaltatori.
-
-    - HSE = appaltatori: nessun bonus/malus.
-    - HSE < appaltatori: malus fino a +30.
-    - HSE > appaltatori: bonus fino a -15.
-    """
-
-    if contractors <= 0:
-        return 0, "Non valutabile"
-
-    ratio = company_hse / contractors
-
-    if company_hse == contractors:
-        return 0, "Copertura equilibrata"
-
-    if company_hse < contractors:
-        shortage_ratio = (
-            contractors - company_hse
-        ) / contractors
-
-        malus = min(
-            shortage_ratio * 30,
-            30
-        )
-
-        return round(malus, 1), "Copertura insufficiente"
-
-    surplus_ratio = (
-        company_hse - contractors
-    ) / contractors
-
-    bonus = min(
-        surplus_ratio * 15,
-        15
-    )
-
-    return -round(bonus, 1), "Copertura superiore al minimo"
-
-
-# =========================================================
-# CALCOLO RISCHIO
-# =========================================================
-def calculate_risk(data):
-    details = []
-    explanations = []
-
-    inspections = data["inspections"]
-    num_nc = data["num_nc"]
-    nc_items = data["nc_items"]
-    activities = data["activities"]
-    awareness_types = data["awareness_types"]
-    awareness_count = data["awareness_count"]
-
-    # -----------------------------------------------------
-    # 1. NON CONFORMITÀ
-    # -----------------------------------------------------
-    nc_score = 0
-
-    for item in nc_items:
-        theme = item["theme"]
-        severity = item["severity"]
-
-        theme_score = NC_THEME_WEIGHTS.get(theme, 6)
-        severity_score = NC_SEVERITY_WEIGHTS.get(severity, 8)
-
-        item_score = theme_score + severity_score
-        nc_score += item_score
-
-        explanations.append(
-            f"NC su '{theme}' con gravità '{severity}': "
-            f"+{item_score} punti grezzi."
-        )
-
-    # Le NC non dettagliate ricevono un peso medio prudenziale
-    unclassified_nc = max(
-        num_nc - len(nc_items),
-        0
-    )
-
-    if unclassified_nc > 0:
-        unclassified_score = min(
-            unclassified_nc * 8,
-            40
-        )
-
-        nc_score += unclassified_score
-
-        explanations.append(
-            f"{unclassified_nc} NC non dettagliate: "
-            f"+{unclassified_score} punti prudenziali."
-        )
-
-    nc_score = min(nc_score, 100)
-
-    # -----------------------------------------------------
-    # 2. INDICE DI DETECTION
-    # Rapporto tra NC e ispezioni
-    # -----------------------------------------------------
-    nc_detection_ratio = (
-        num_nc / max(inspections, 1)
-    )
-
-    if nc_detection_ratio >= 1:
-        detection_penalty = 25
-        explanations.append(
-            "Indice di detection molto elevato: "
-            "almeno una NC per ispezione, +25 punti."
-        )
-
-    elif nc_detection_ratio >= 0.5:
-        detection_penalty = 15
-        explanations.append(
-            "Indice di detection significativo: "
-            "almeno una NC ogni due ispezioni, +15 punti."
-        )
-
-    elif nc_detection_ratio >= 0.25:
-        detection_penalty = 8
-        explanations.append(
-            "Indice di detection moderato: "
-            "almeno una NC ogni quattro ispezioni, +8 punti."
-        )
-
-    else:
-        detection_penalty = 0
-        explanations.append(
-            "Indice di detection contenuto: "
-            "nessun malus aggiuntivo."
-        )
-
-    # -----------------------------------------------------
-    # 3. BONUS/MALUS RAPPORTO ISPEZIONI
-    # -----------------------------------------------------
-    if inspections == 0 and num_nc > 0:
-        inspection_ratio_adjustment = 30
-
-        explanations.append(
-            "NC presenti senza ispezioni registrate: "
-            "malus rapporto ispezioni +30."
-        )
-
-    elif inspections < 3 and num_nc >= 3:
-        inspection_ratio_adjustment = 25
-
-        explanations.append(
-            "Numero di ispezioni insufficiente rispetto alle NC: "
-            "malus rapporto ispezioni +25."
-        )
-
-    elif inspections >= 20 and num_nc <= 2:
-        inspection_ratio_adjustment = -10
-
-        explanations.append(
-            "Elevato presidio ispettivo con poche NC: "
-            "bonus rapporto ispezioni -10."
-        )
-
-    elif inspections >= 10 and num_nc <= 2:
-        inspection_ratio_adjustment = -5
-
-        explanations.append(
-            "Buon presidio ispettivo con poche NC: "
-            "bonus rapporto ispezioni -5."
-        )
-
-    else:
-        inspection_ratio_adjustment = 0
-
-        explanations.append(
-            "Rapporto ispezioni/NC nella fascia neutra: "
-            "nessun bonus o malus."
-        )
-
-    # -----------------------------------------------------
-    # 4. STOP WORK - SOLO BONUS, CON IMPATTO LIMITATO
-    # -----------------------------------------------------
-    stop_work_bonus = min(
-        data["stopworks"] * STOP_WORK_BONUS_PER_EVENT,
-        STOP_WORK_BONUS_CAP
-    )
-
-    if data["stopworks"] > 0:
-        explanations.append(
-            f"{data['stopworks']} Stop Work registrati: "
-            f"bonus cultura della sicurezza -{stop_work_bonus:.1f}. "
-            "Il beneficio è limitato per evitare che compensi "
-            "eccessivamente altri fattori di rischio."
-        )
-    else:
-        explanations.append(
-            "Nessuno Stop Work registrato: nessun bonus applicato."
-        )
-
-    # -----------------------------------------------------
-    # 5. CRITICITÀ
-    # -----------------------------------------------------
-    crit_score = min(
-        data["crit_open"] * 12
-        + data["crit_late"] * 10
-        + data["crit_ontime"] * 3,
-        100
-    )
-
-    if data["crit_open"] > 0:
-        explanations.append(
-            f"{data['crit_open']} criticità aperte: "
-            "incremento del rischio."
-        )
-
-    if data["crit_late"] > 0:
-        explanations.append(
-            f"{data['crit_late']} criticità risolte in ritardo: "
-            "peggioramento del follow-up."
-        )
-
-    if data["crit_ontime"] > 0:
-        explanations.append(
-            f"{data['crit_ontime']} criticità risolte nei tempi: "
-            "mantengono un peso residuo limitato."
-        )
-
-    # -----------------------------------------------------
-    # 6. COMPLESSITÀ ORGANIZZATIVA
-    # -----------------------------------------------------
-    complexity_score = min(
-        data["app"] * 5
-        + data["sub"] * 8,
-        70
-    )
-
-    if data["sub"] >= 5:
-        complexity_score += 15
-
-        explanations.append(
-            "Numero elevato di subappaltatori: "
-            "+15 punti grezzi aggiuntivi."
-        )
-
-    complexity_score = min(
-        complexity_score,
-        100
-    )
-
-    # -----------------------------------------------------
-    # 7. COPERTURA HSE IMPRESE
-    # -----------------------------------------------------
-    hse_coverage_adjustment, hse_coverage_status = (
-        calculate_hse_coverage(
-            data["app"],
-            data["company_hse"]
-        )
-    )
-
-    if hse_coverage_adjustment > 0:
-        explanations.append(
-            f"Copertura HSE insufficiente: "
-            f"{data['company_hse']} HSE per "
-            f"{data['app']} appaltatori, "
-            f"malus +{hse_coverage_adjustment}."
-        )
-
-    elif hse_coverage_adjustment < 0:
-        explanations.append(
-            f"Copertura HSE superiore al rapporto 1:1: "
-            f"{data['company_hse']} HSE per "
-            f"{data['app']} appaltatori, "
-            f"bonus {hse_coverage_adjustment}."
-        )
-
-    else:
-        explanations.append(
-            "Copertura HSE equilibrata rispetto agli appaltatori: "
-            "nessun bonus o malus."
-        )
-
-    # -----------------------------------------------------
-    # 8. TIPOLOGIA E NUMERO ATTIVITÀ
-    # -----------------------------------------------------
-    activity_score = 0
-
-    for activity in activities:
-        score = ACTIVITY_WEIGHTS.get(
-            activity,
-            6
-        )
-
-        activity_score += score
-
-        explanations.append(
-            f"Attività '{activity}': "
-            f"+{score} punti grezzi."
-        )
-
-    # Mantiene la logica già presente relativa al numero
-    # di attività contemporanee.
-    if len(activities) >= 3:
-        activity_score += 20
-
-        explanations.append(
-            "Tre o più tipologie di attività contemporanee: "
-            "+20 punti grezzi."
-        )
-
-    if len(activities) >= 5:
-        activity_score += 15
-
-        explanations.append(
-            "Cinque o più tipologie di attività contemporanee: "
-            "+15 punti grezzi aggiuntivi."
-        )
-
-    activity_score = min(
-        activity_score,
-        100
-    )
-
-    # -----------------------------------------------------
-    # 9. LIVELLO INTERFERENZA ATTIVITÀ
-    # -----------------------------------------------------
-    (
-        interference_score,
-        activity_criticality_factor,
-        activity_count_factor
-    ) = calculate_interference_score(
-        data["interference_level"],
-        activities
-    )
-
-    if activities:
-        explanations.append(
-            f"Livello di interferenza "
-            f"{data['interference_level']}/10, "
-            f"corretto per pericolosità e numero attività: "
-            f"{interference_score} punti grezzi."
-        )
-    else:
-        explanations.append(
-            "Nessuna attività selezionata: "
-            "interferenza non valorizzata."
-        )
-
-    # -----------------------------------------------------
-    # 10. CORRELAZIONE ATTIVITÀ / NC
-    # -----------------------------------------------------
-    correlation_penalty = 0
-
-    nc_themes = [
-        item["theme"]
-        for item in nc_items
+    nc_load, crit_load = anomaly_load(d['nc_items']), anomaly_load(d['crit_items'])
+    nc = 100 * (1 - math.exp(-nc_load / 10))
+    crit = 100 * (1 - math.exp(-crit_load / 12))
+    activity = min(100, max(ACTIVITY[a] for a in d['activities']) + 3 * (len(d['activities']) - 1))
+    interference = (d['interference_level'] - 1) / 9 * 100
+    org = 100 * (1 - math.exp(-(max(0, d['app'] - 1) + 1.2 * d['sub']) / 8))
+    # Nessun requisito universale "un HSE per impresa": si valuta la copertura reale dichiarata.
+    inspection_deficit = 100 * (1 - min(1, d['inspections'] / d['inspection_target']))
+    controls = .65 * (100 - d['hse_coverage']) + .35 * inspection_deficit
+    components = dict(zip(WEIGHTS, [nc, crit, activity, interference, org, controls]))
+    drivers = [{'Area': key, 'Indice area': round(value, 3), 'Peso massimo': WEIGHTS[key],
+                'Contributo': value * WEIGHTS[key] / 100} for key, value in components.items()]
+    positive = min(2., d['stop_positive'] * .5)
+    negative = min(6., d['stop_negative'] * 1.5)
+    needs, reasons = topic_needs(d)
+    numerator = 0.
+    awareness_details = []
+    for row in d['awareness']:
+        theme = row['theme']
+        coverage = row['coverage'] / 100 if row['coverage'] is not None else .5
+        continuity = min(1., .7 + .1 * (row['count'] - 1))
+        effectiveness = coverage * continuity
+        contribution = needs.get(theme, 0) * effectiveness
+        numerator += contribution
+        awareness_details.append({'Tema': theme, 'Incontri': row['count'],
+            'Copertura': f"{row['coverage']:.0f}%" if row['coverage'] is not None else 'Non nota: fattore 50%',
+            'Pertinenza': round(needs.get(theme, 0), 3), 'Efficacia convenzionale': round(effectiveness, 3),
+            'Motivo': '; '.join(reasons.get(theme, ['Nessun collegamento agli input: nessun bonus']))})
+    awareness = 8 * numerator / sum(needs.values()) if needs else 0.
+    raw = sum(x['Contributo'] for x in drivers) + negative - positive - awareness
+    high_open = sum(r['severity'] == 'alta' and r['status'] == 'Aperta' for r in d['nc_items'])
+    floor = 81. if d['imminent_danger'] or high_open >= 2 else 61. if high_open == 1 else 0.
+    floor_reason = ('Pericolo grave e attuale dichiarato' if d['imminent_danger'] else
+                    'Almeno due NC formali alte aperte' if high_open >= 2 else
+                    'Una NC formale alta aperta' if high_open else 'Nessuna soglia minima attiva')
+    score = max(floor, bounded(raw))
+    # Esposizione solo nell'indice contestualizzato: ore > giorni > lavoratori.
+    contextual_target, context_basis = None, 'Nessun dato di esposizione disponibile'
+    if d.get('hours'):
+        contextual_target, context_basis = max(1., d['hours'] / 2000), '1 ispezione ogni 2.000 ore lavorate'
+    elif d.get('days'):
+        contextual_target = max(1., d['days'] / 5 * max(1., (d.get('workers') or 50) / 50))
+        context_basis = '1 ispezione ogni 5 giorni operativi e ogni 50 lavoratori medi (minimo fattore 1)'
+    elif d.get('workers'):
+        contextual_target, context_basis = max(1., 4 * d['workers'] / 50), '4 ispezioni per 50 lavoratori medi nel mese'
+    contextual = None
+    if contextual_target:
+        context_controls = .65 * (100 - d['hse_coverage']) + .35 * 100 * (1 - min(1., d['inspections'] / contextual_target))
+        contextual = max(floor, bounded(raw + (context_controls - controls) * .15))
+    saturation = bounded(raw) - raw
+    drivers.extend([{'Area': 'Stop Work negativi', 'Indice area': None, 'Peso massimo': 6, 'Contributo': negative},
+                    {'Area': 'Stop Work positivi', 'Indice area': None, 'Peso massimo': -2, 'Contributo': -positive},
+                    {'Area': 'Sensibilizzazioni pertinenti', 'Indice area': None, 'Peso massimo': -8, 'Contributo': -awareness},
+                    {'Area': 'Limite scala 0–100', 'Indice area': None, 'Peso massimo': None, 'Contributo': saturation},
+                    {'Area': 'Soglia minima di tutela', 'Indice area': None, 'Peso massimo': None, 'Contributo': score - bounded(raw)}])
+    explanations = [
+        f'NC formali: carico {nc_load:.2f}; indice area = 100 × (1 − exp(−carico/10)); massimo 30 punti.',
+        f'Criticità informali: carico {crit_load:.2f}; indice area = 100 × (1 − exp(−carico/12)); massimo 8 punti.',
+        'Carico anomalia = gravità (1/2,5/5) × tema (0,65–1,25) × stato (aperta 1; chiusa nei tempi 0,2; chiusa in ritardo 0,4) × scaduta (1,25) × recidiva (1,2).',
+        'I temi modificano la priorità convenzionale; la gravità deve essere assegnata in base al potenziale danno del caso concreto.',
+        'Attività: massima pericolosità convenzionale + 3 per ogni tipologia aggiuntiva, massimo 100; peso 22%.',
+        'Interferenze: (livello − 1)/9 × 100, peso 15%. Non viene riapplicata la pericolosità delle attività.',
+        'Organizzazione: 100 × (1 − exp(−(appaltatori−1 + 1,2×subappaltatori)/8)), peso 10%.',
+        f'Presidio: 65% deficit copertura HSE + 35% deficit ispezioni rispetto al target dichiarato ({d["inspection_target"]}); peso 15%.',
+        'Nessun malus sul rapporto NC/ispezioni: rilevare più anomalie non rende meno efficace il controllo. Il rapporto resta descrittivo.',
+        f'Sensibilizzazioni: −{awareness:.2f}/8. Copertura ponderata dei temi necessari; continuità da 0,7 a 1; copertura non nota usa fattore prudenziale 0,5.',
+        f'Stop Work: positivi −{positive:.2f}/2; negativi +{negative:.2f}/6. Ogni evento va classificato una sola volta; anomalia sottostante registrata una sola volta.',
+        f'Soglia minima: {floor:.0f}. {floor_reason}. Le criticità informali da sole non attivano una soglia.',
+        'I pesi più alti delle NC formali sono una scelta gestionale richiesta, non una dimostrazione di maggiore pericolosità fisica.',
+        'Pesi, soglie e target sono ipotesi iniziali di calibrazione; non derivano da dati storici né da un modello predittivo validato.'
     ]
-
-    for activity in activities:
-        expected_nc_themes = LINKS_ACTIVITY_NC.get(
-            activity,
-            []
-        )
-
-        for theme in expected_nc_themes:
-            if theme in nc_themes:
-                correlation_penalty += 15
-
-                explanations.append(
-                    f"Correlazione critica tra attività "
-                    f"'{activity}' e NC su '{theme}': "
-                    "+15 punti."
-                )
-
-    correlation_penalty = min(
-        correlation_penalty,
-        45
-    )
-
-    # -----------------------------------------------------
-    # 11. FASE DEL CANTIERE
-    # -----------------------------------------------------
-    # La fase resta un dato operativo e viene utilizzata per
-    # valutare la coerenza delle sensibilizzazioni. Non genera
-    # più alcun malus diretto sul Risk Index.
-    phase_score = 0
-
-    explanations.append(
-        f"Fase '{data['fase']}': nessun impatto diretto "
-        "sul Risk Index; utilizzata per la verifica di coerenza "
-        "delle sensibilizzazioni."
-    )
-
-    # -----------------------------------------------------
-    # 12. BONUS SENSIBILIZZAZIONI
-    # -----------------------------------------------------
-    awareness_bonus = 0
-
-    for awareness in awareness_types:
-        bonus = AWARENESS_BONUS.get(
-            awareness,
-            2
-        )
-
-        awareness_bonus += bonus
-
-        explanations.append(
-            f"Sensibilizzazione '{awareness}': "
-            f"bonus -{bonus}."
-        )
-
-    if awareness_count >= 5:
-        awareness_bonus += 5
-
-        explanations.append(
-            "Almeno cinque sensibilizzazioni: "
-            "bonus aggiuntivo -5."
-        )
-
-    if awareness_count >= 10:
-        awareness_bonus += 5
-
-        explanations.append(
-            "Almeno dieci sensibilizzazioni: "
-            "bonus continuità -5."
-        )
-
-    for awareness in awareness_types:
-        covered_activities = LINKS_AWARENESS_ACTIVITY.get(
-            awareness,
-            []
-        )
-
-        for activity in activities:
-            if activity in covered_activities:
-                awareness_bonus += 5
-
-                explanations.append(
-                    f"Sensibilizzazione '{awareness}' "
-                    f"coerente con attività '{activity}': "
-                    "bonus -5."
-                )
-
-    phase_awareness_matches = [
-        awareness
-        for awareness in awareness_types
-        if awareness in LINKS_PHASE_AWARENESS.get(
-            data["fase"],
-            []
-        )
-    ]
-
-    phase_awareness_bonus = min(
-        len(phase_awareness_matches)
-        * PHASE_AWARENESS_BONUS_PER_MATCH,
-        PHASE_AWARENESS_BONUS_CAP
-    )
-
-    if phase_awareness_bonus > 0:
-        awareness_bonus += phase_awareness_bonus
-
-        explanations.append(
-            f"Sensibilizzazioni coerenti con la fase "
-            f"'{data['fase']}': "
-            f"{', '.join(phase_awareness_matches)}. "
-            f"Bonus aggiuntivo -{phase_awareness_bonus}."
-        )
-    else:
-        explanations.append(
-            f"Nessuna sensibilizzazione specificamente coerente "
-            f"con la fase '{data['fase']}': "
-            "nessun bonus di coerenza fase."
-        )
-
-    awareness_bonus = min(
-        awareness_bonus,
-        35
-    )
-
-    # -----------------------------------------------------
-    # FORMULA FINALE
-    # -----------------------------------------------------
-    risk = (
-        nc_score * 0.20
-        + crit_score * 0.15
-        + activity_score * 0.18
-        + complexity_score * 0.10
-        + interference_score * 0.12
-        + detection_penalty
-        + inspection_ratio_adjustment
-        + correlation_penalty
-        + hse_coverage_adjustment
-        - awareness_bonus
-        - stop_work_bonus
-    )
-
-    risk = max(
-        0,
-        min(100, risk)
-    )
-
-    level = risk_level(risk)
-
-    # Nel grafico vengono mostrati gli impatti effettivi
-    # già moltiplicati per il peso della formula.
-    details.append((
-        "NC",
-        round(nc_score * 0.20, 1)
-    ))
-
-    details.append((
-        "Criticità",
-        round(crit_score * 0.15, 1)
-    ))
-
-    details.append((
-        "Attività",
-        round(activity_score * 0.18, 1)
-    ))
-
-    details.append((
-        "Interferenza attività",
-        round(interference_score * 0.12, 1)
-    ))
-
-    details.append((
-        "Complessità organizzativa",
-        round(complexity_score * 0.10, 1)
-    ))
-
-    details.append((
-        "Copertura HSE imprese",
-        round(hse_coverage_adjustment, 1)
-    ))
-
-    details.append((
-        "Bonus Stop Work",
-        round(-stop_work_bonus, 1)
-    ))
-
-    details.append((
-        "Indice di detection",
-        round(detection_penalty, 1)
-    ))
-
-    details.append((
-        "Bonus/Malus rapporto ispezioni",
-        round(inspection_ratio_adjustment, 1)
-    ))
-
-    details.append((
-        "Correlazioni critiche",
-        round(correlation_penalty, 1)
-    ))
-
-    details.append((
-        "Bonus sensibilizzazioni",
-        round(-awareness_bonus, 1)
-    ))
-
-    technical_data = {
-        "nc_detection_ratio": round(nc_detection_ratio, 2),
-        "interference_score": interference_score,
-        "activity_criticality_factor": activity_criticality_factor,
-        "activity_count_factor": activity_count_factor,
-        "hse_coverage_adjustment": hse_coverage_adjustment,
-        "hse_coverage_status": hse_coverage_status,
-        "stop_work_bonus": round(stop_work_bonus, 1),
-        "phase_direct_impact": 0,
-        "phase_awareness_matches": phase_awareness_matches,
-        "phase_awareness_bonus": phase_awareness_bonus
-    }
-
-    return (
-        risk,
-        level,
-        details,
-        explanations,
-        technical_data
-    )
-
-
-# =========================================================
-# AZIONI E ALERT
-# =========================================================
-def generate_base_actions(
-    data,
-    risk,
-    level,
-    technical_data
-):
-    actions = []
-
-    nc_themes = [
-        item["theme"]
-        for item in data["nc_items"]
-    ]
-
-    high_nc = [
-        item
-        for item in data["nc_items"]
-        if item["severity"] == "alta"
-    ]
-
-    if risk >= 80:
-        actions.append((
-            "MUST HAVE",
-            "🔴 Rischio critico: convocare immediatamente "
-            "il coordinamento operativo e validare le misure "
-            "prima della prosecuzione."
-        ))
-
-    if high_nc:
-        actions.append((
-            "MUST HAVE",
-            f"🔴 Presenti {len(high_nc)} NC ad alta gravità. "
-            "Definire responsabile, scadenza, azione correttiva "
-            "e verifica di efficacia."
-        ))
-
-    if technical_data["nc_detection_ratio"] >= 1:
-        actions.append((
-            "MUST HAVE",
-            "🔴 Indice di detection molto elevato: viene rilevata "
-            "almeno una NC per ogni ispezione. Analizzare le cause "
-            "ricorrenti e rafforzare la prevenzione."
-        ))
-
-    elif technical_data["nc_detection_ratio"] >= 0.5:
-        actions.append((
-            "MUST HAVE",
-            "🟠 Indice di detection significativo: aumentare "
-            "il controllo preventivo e verificare la ripetitività "
-            "delle NC."
-        ))
-
-    if data["interference_level"] >= 8:
-        actions.append((
-            "MUST HAVE",
-            f"🔴 Interferenza attività molto elevata "
-            f"({data['interference_level']}/10): valutare "
-            "separazione temporale o spaziale delle lavorazioni."
-        ))
-
-    elif data["interference_level"] >= 6:
-        actions.append((
-            "MUST HAVE",
-            f"🟠 Interferenza attività elevata "
-            f"({data['interference_level']}/10): predisporre "
-            "coordinamento giornaliero e matrice interferenze."
-        ))
-
-    if data["company_hse"] < data["app"]:
-        actions.append((
-            "MUST HAVE",
-            f"🟠 Copertura HSE insufficiente: "
-            f"{data['company_hse']} HSE rispetto a "
-            f"{data['app']} appaltatori. Rafforzare il presidio "
-            "o formalizzare una diversa organizzazione di controllo."
-        ))
-
-    elif data["company_hse"] > data["app"]:
-        actions.append((
-            "NICE TO HAVE",
-            "🟢 Copertura HSE superiore al rapporto 1:1. "
-            "Mantenere il presidio e orientarlo sulle attività "
-            "a maggiore interferenza."
-        ))
-
-    for activity in data["activities"]:
-        if activity == "elettrici":
-            actions.append((
-                "MUST HAVE",
-                "⚡ Verificare sezionamenti, LOTO, autorizzazioni, "
-                "DPI e competenze PES/PAV/PEI."
-            ))
-
-        elif activity == "scavi":
-            actions.append((
-                "MUST HAVE",
-                "🚧 Verificare sottoservizi, stabilità dei fronti, "
-                "accessi, delimitazioni e condizioni dello scavo."
-            ))
-
-        elif activity == "lavori in quota":
-            actions.append((
-                "MUST HAVE",
-                "🪜 Verificare parapetti, ancoraggi, PLE, "
-                "imbracature e piano di emergenza."
-            ))
-
-        elif activity == "sollevamenti":
-            actions.append((
-                "MUST HAVE",
-                "🏗️ Verificare piano di sollevamento, portate, "
-                "accessori, interferenze e segregazione dell'area."
-            ))
-
-        elif activity == "spazi confinati":
-            actions.append((
-                "MUST HAVE",
-                "☠️ Verificare autorizzazione, atmosfera, "
-                "recupero di emergenza e presidio esterno."
-            ))
-
-        elif activity == "hot work":
-            actions.append((
-                "MUST HAVE",
-                "🔥 Verificare permesso hot work, estintori, "
-                "materiali combustibili e fire watch."
-            ))
-
-    if len(data["activities"]) >= 3:
-        actions.append((
-            "MUST HAVE",
-            "🔴 Predisporre matrice interferenziale giornaliera "
-            "e briefing pre-job tra le imprese."
-        ))
-
-    if "elettrico" in nc_themes:
-        actions.append((
-            "MUST HAVE",
-            "🔴 NC elettriche: sospendere le lavorazioni "
-            "non conformi fino al ripristino delle condizioni sicure."
-        ))
-
-    if "scavi" in nc_themes:
-        actions.append((
-            "MUST HAVE",
-            "🔴 NC sugli scavi: rivalutare stabilità, accessi, "
-            "delimitazioni e sottoservizi."
-        ))
-
-    if "quota" in nc_themes:
-        actions.append((
-            "MUST HAVE",
-            "🔴 NC sui lavori in quota: verificare immediatamente "
-            "protezioni collettive e sistemi anticaduta."
-        ))
-
-    if data["awareness_count"] == 0:
-        actions.append((
-            "MUST HAVE",
-            "🟡 Nessuna sensibilizzazione registrata: "
-            "pianificare toolbox mirati prima delle attività critiche."
-        ))
-
-    missing_awareness = []
-
-    if (
-        "elettrici" in data["activities"]
-        and "rischio elettrico" not in data["awareness_types"]
-    ):
-        missing_awareness.append("rischio elettrico")
-
-    if (
-        "scavi" in data["activities"]
-        and "scavi e sottoservizi" not in data["awareness_types"]
-    ):
-        missing_awareness.append("scavi e sottoservizi")
-
-    if (
-        "lavori in quota" in data["activities"]
-        and "lavori in quota" not in data["awareness_types"]
-    ):
-        missing_awareness.append("lavori in quota")
-
-    if (
-        "sollevamenti" in data["activities"]
-        and "sollevamenti" not in data["awareness_types"]
-    ):
-        missing_awareness.append("sollevamenti")
-
-    if missing_awareness:
-        actions.append((
-            "MUST HAVE",
-            "🟠 Mancano sensibilizzazioni mirate su: "
-            + ", ".join(missing_awareness)
-            + "."
-        ))
-
-    if data["crit_open"] > 0:
-        actions.append((
-            "MUST HAVE",
-            f"🟠 Criticità aperte: {data['crit_open']}. "
-            "Definire priorità, owner e data di chiusura."
-        ))
-
-    if data["crit_late"] > 0:
-        actions.append((
-            "MUST HAVE",
-            f"🟠 Criticità chiuse in ritardo: "
-            f"{data['crit_late']}. Analizzare le cause del ritardo."
-        ))
-
-    if level in ["Basso", "Medio basso"]:
-        actions.append((
-            "NICE TO HAVE",
-            "🟢 Mantenere il trend positivo con ispezioni mirate, "
-            "tracciamento NC e toolbox sulle attività giornaliere."
-        ))
-
-    if len(actions) < 4:
-        actions.append((
-            "IDEA",
-            "Mantenere il presidio operativo e aggiornare "
-            "la valutazione al variare delle attività."
-        ))
-
-    return actions
-
-
-# =========================================================
-# EXECUTIVE SUMMARY
-# =========================================================
-def local_executive_summary(
-    data,
-    risk,
-    level,
-    driver_df,
-    technical_data
-):
-    malus_drivers = (
-        driver_df[driver_df["Valore"] > 0]
-        .sort_values("Valore", ascending=False)
-        .head(3)
-    )
-
-    if malus_drivers.empty:
-        top_text = "nessun driver negativo dominante"
-    else:
-        top_text = ", ".join(
-            f"{row['Driver']} ({round(row['Valore'], 1)})"
-            for _, row in malus_drivers.iterrows()
-        )
-
-    activities = (
-        ", ".join(data["activities"])
-        if data["activities"]
-        else "nessuna attività critica selezionata"
-    )
-
-    awareness = (
-        ", ".join(data["awareness_types"])
-        if data["awareness_types"]
-        else "nessuna sensibilizzazione mirata"
-    )
-
-    if level in ["Alto", "Critico"]:
-        decision = (
-            "Si raccomanda un coordinamento operativo immediato, "
-            "con verifica delle attività critiche, delle interferenze, "
-            "della copertura HSE e delle NC prioritarie."
-        )
-
-    elif level == "Medio":
-        decision = (
-            "Si raccomanda di rafforzare il presidio operativo, "
-            "ridurre le interferenze e programmare azioni mirate."
-        )
-
-    else:
-        decision = (
-            "Il livello risulta sotto controllo, ma deve essere "
-            "mantenuto il monitoraggio al variare delle attività."
-        )
-
-    return f"""
-Il cantiere **{data['nome']}** presenta un Risk Index pari a
-**{round(risk)} / 100**, classificato come **{level}**.
-
-I principali driver negativi sono: **{top_text}**.
-
-Le attività in corso sono: **{activities}**.
-
-Il livello di interferenza dichiarato è **{data['interference_level']}/10**,
-con un impatto calcolato pari a
-**{technical_data['interference_score']} punti grezzi**.
-
-La copertura HSE è pari a **{data['company_hse']} HSE**
-rispetto a **{data['app']} appaltatori**:
-**{technical_data['hse_coverage_status']}**.
-
-L'indice di detection è pari a
-**{technical_data['nc_detection_ratio']} NC per ispezione**.
-
-Le sensibilizzazioni registrate sono: **{awareness}**.
-
-{decision}
-"""
-
-
-# =========================================================
-# ROOT CAUSE
-# =========================================================
-def local_root_cause(
-    data,
-    risk,
-    level,
-    technical_data,
-    driver_df=None
-):
-    categories = {
-        "Non conformità": [],
-        "Attività": [],
-        "Interferenze": [],
-        "Organizzazione": [],
-        "Controlli": [],
-        "Cultura HSE": []
-    }
-
-    high_nc = [item for item in data["nc_items"] if item["severity"] == "alta"]
-    nc_themes = [item["theme"] for item in data["nc_items"]]
-
-    if data["num_nc"] > 0:
-        categories["Non conformità"].append(
-            f"Sono presenti {data['num_nc']} NC, di cui {len(high_nc)} ad alta gravità."
-        )
-    else:
-        categories["Non conformità"].append("Non risultano NC registrate nel periodo analizzato.")
-
-    if technical_data["nc_detection_ratio"] >= 0.5:
-        categories["Non conformità"].append(
-            f"L'indice di detection è significativo ({technical_data['nc_detection_ratio']} NC/ispezione)."
-        )
-
-    if data["activities"]:
-        categories["Attività"].append(
-            "Attività presenti: " + ", ".join(data["activities"]) + "."
-        )
-    if len(data["activities"]) >= 3:
-        categories["Attività"].append(
-            "La contemporaneità di almeno tre tipologie di lavoro aumenta la complessità operativa."
-        )
-
-    categories["Interferenze"].append(
-        f"Il livello dichiarato è {data['interference_level']}/10, con impatto tecnico pari a {technical_data['interference_score']} punti grezzi."
-    )
-    if data["interference_level"] >= 6:
-        categories["Interferenze"].append(
-            "È necessario rafforzare la separazione spaziale o temporale e il coordinamento giornaliero."
-        )
-
-    categories["Organizzazione"].append(
-        f"Sono presenti {data['app']} appaltatori, {data['sub']} subappaltatori e {data['company_hse']} HSE delle imprese."
-    )
-    categories["Organizzazione"].append(
-        f"Valutazione della copertura HSE: {technical_data['hse_coverage_status']}."
-    )
-    if data["sub"] >= 5:
-        categories["Organizzazione"].append(
-            "L'elevato numero di subappaltatori richiede una governance più strutturata."
-        )
-
-    if data["crit_open"] > 0:
-        categories["Controlli"].append(
-            f"Sono ancora aperte {data['crit_open']} criticità."
-        )
-    if data["crit_late"] > 0:
-        categories["Controlli"].append(
-            f"Sono state chiuse in ritardo {data['crit_late']} criticità, segnale di follow-up da rafforzare."
-        )
-    if data["inspections"] == 0:
-        categories["Controlli"].append("Non risultano ispezioni registrate.")
-    else:
-        categories["Controlli"].append(f"Sono state registrate {data['inspections']} ispezioni HSE.")
-
-    if data["awareness_count"] > 0:
-        categories["Cultura HSE"].append(
-            f"Sono state eseguite {data['awareness_count']} sensibilizzazioni."
-        )
-    else:
-        categories["Cultura HSE"].append(
-            "Non risultano sensibilizzazioni registrate: manca un elemento preventivo rilevante."
-        )
-    if data["stopworks"] > 0:
-        categories["Cultura HSE"].append(
-            f"Sono stati registrati {data['stopworks']} Stop Work, considerati un segnale positivo di partecipazione."
-        )
-
-    contribution_map = {
-        "Non conformità": ["NC", "Indice di detection", "Correlazioni critiche"],
-        "Attività": ["Attività"],
-        "Interferenze": ["Interferenza attività"],
-        "Organizzazione": ["Complessità organizzativa", "Copertura HSE imprese"],
-        "Controlli": ["Criticità", "Bonus/Malus rapporto ispezioni"],
-        "Cultura HSE": ["Bonus Stop Work", "Bonus sensibilizzazioni"],
-    }
-
-    contributions = {}
-    if driver_df is not None:
-        for category, drivers in contribution_map.items():
-            value = driver_df[driver_df["Driver"].isin(drivers)]["Valore"].sum()
-            contributions[category] = round(float(value), 1)
-    else:
-        contributions = {category: 0.0 for category in categories}
-
-    positive = {key: max(value, 0) for key, value in contributions.items()}
-    total_positive = sum(positive.values())
-    percentages = {
-        key: round((value / total_positive) * 100) if total_positive > 0 else 0
-        for key, value in positive.items()
-    }
-
-    blocks = []
-    for category, items in categories.items():
-        impact = contributions.get(category, 0)
-        percentage = percentages.get(category, 0)
-        blocks.append(f"### {category}\n\n**Contributo netto:** {impact:+.1f} punti | **Quota dei driver negativi:** {percentage}%")
-        blocks.extend(f"- {item}" for item in items)
-
-    dominant = max(positive, key=positive.get) if positive else "nessuna categoria"
-    conclusion = (
-        f"### Conclusione complessiva\n\nIl Risk Index è **{round(risk)}/100 ({level})**. "
-        f"La categoria che contribuisce maggiormente ai driver negativi è **{dominant}**. "
-        "Le priorità devono essere definite sulla base dei contributi più elevati, senza trascurare "
-        "eventuali NC ad alta gravità o condizioni non controllate anche quando il loro peso numerico è limitato."
-    )
-
-    return "\n\n".join(blocks + [conclusion])
-
-
-# =========================================================
-# TOOLBOX TALK
-# =========================================================
-def local_toolbox_talk(
-    data,
-    technical_data
-):
-    activities = data["activities"]
-
-    nc_themes = [
-        item["theme"]
-        for item in data["nc_items"]
-    ]
-
-    title_parts = []
-
-    if activities:
-        title_parts.extend(activities[:2])
-
-    if nc_themes:
-        title_parts.extend(nc_themes[:2])
-
-    title = (
-        " / ".join(title_parts)
-        if title_parts
-        else "Sicurezza operativa giornaliera"
-    )
-
-    rules = [
-        "Non iniziare attività senza autorizzazione e briefing pre-job.",
-        "Verificare le interferenze con le altre imprese prima di iniziare.",
-        "Segnalare immediatamente variazioni del programma di lavoro.",
-        "Mantenere l'area ordinata, accessibile e segregata.",
-        "Utilizzare i DPI previsti per il rischio specifico.",
-        "Applicare lo Stop Work in caso di condizione non controllata."
-    ]
-
-    if data["interference_level"] >= 6:
-        rules.append(
-            "Il livello di interferenza è elevato: rispettare "
-            "aree, orari e sequenze operative concordate."
-        )
-
-    if data["company_hse"] < data["app"]:
-        rules.append(
-            "In assenza di presidio HSE dedicato, il preposto deve "
-            "segnalare immediatamente ogni variazione o criticità."
-        )
-
-    if "elettrici" in activities or "elettrico" in nc_themes:
-        rules.append(
-            "Per le attività elettriche verificare sezionamento, "
-            "assenza tensione e procedura LOTO."
-        )
-
-    if "scavi" in activities or "scavi" in nc_themes:
-        rules.append(
-            "Per gli scavi verificare sottoservizi, stabilità "
-            "dei fronti e accessi sicuri."
-        )
-
-    if "lavori in quota" in activities or "quota" in nc_themes:
-        rules.append(
-            "Per i lavori in quota verificare le protezioni "
-            "anticaduta prima dell'accesso."
-        )
-
-    if "sollevamenti" in activities:
-        rules.append(
-            "Nessuno deve sostare sotto carichi sospesi "
-            "o nelle aree di manovra."
-        )
-
-    rules_text = "\n".join(
-        f"- {rule}"
-        for rule in rules
-    )
-
-    return f"""
-### Titolo
-
-**Toolbox Talk - {title}**
-
-### Dati operativi
-
-- Fase: **{data['fase']}**
-- Interferenza: **{data['interference_level']}/10**
-- HSE imprese: **{data['company_hse']}**
-- Appaltatori: **{data['app']}**
-- Indice di detection:
-  **{technical_data['nc_detection_ratio']} NC/ispezione**
-
-### Obiettivo
-
-Allineare la squadra sui rischi della giornata,
-sulle interferenze e sulle condizioni minime di sicurezza.
-
-### Regole operative
-
-{rules_text}
-
-### Comportamenti vietati
-
-- Iniziare lavorazioni fuori programma senza coordinamento.
-- Rimuovere segregazioni o protezioni.
-- Accedere alle aree di un'altra impresa senza autorizzazione.
-- Proseguire in presenza di un rischio non controllato.
-
-### Domande finali
-
-1. Quali attività interferiscono con la nostra?
-2. Chi coordina le lavorazioni di oggi?
-3. Qual è il rischio principale?
-4. Chi deve essere avvisato in caso di variazione?
-5. Quando deve essere applicato lo Stop Work?
-"""
-
-
-# =========================================================
-# ACTION PLAN
-# =========================================================
-def local_action_plan(
-    data,
-    risk,
-    level,
-    technical_data
-):
+    missing = []
+    if not d['inspections']:
+        missing.append('Nessuna ispezione: assenza di NC non dimostra assenza di anomalie.')
+    if any(d.get(k) is None for k in ['hours', 'workers', 'days']):
+        missing.append('Dati di esposizione parziali o assenti: usare l’indice base per la graduatoria comune.')
+    if any(r['coverage'] is None for r in d['awareness']):
+        missing.append('Copertura delle sensibilizzazioni non sempre nota.')
+    return dict(version=MODEL_VERSION, score=round(score, 2), level=risk_level(score),
+                raw=round(raw, 3), floor=floor, floor_reason=floor_reason,
+                drivers=drivers, awareness_details=awareness_details, awareness_bonus=round(awareness, 3),
+                needs=needs, reasons=reasons, context_score=round(contextual, 2) if contextual is not None else None,
+                context_target=round(contextual_target, 2) if contextual_target else None, context_basis=context_basis,
+                explanations=explanations, missing=missing)
+
+
+TOOLBOX_CONTENT = {
+ 'elettrico': ('Contatti elettrici, arco elettrico e riattivazione inattesa',
+  ['Verificare stato dell’impianto, confini dell’area e responsabili operativi prima di iniziare.',
+   'Applicare la procedura di messa in sicurezza prevista e verificare le condizioni per la consegna del lavoro.',
+   'Controllare utensili, DPI previsti e separazione dalle parti che restano in servizio.'],
+  'Chi conferma le condizioni di sicurezza e cosa fate se lo stato dell’impianto cambia?'),
+ 'scavi': ('Intercettazione sottoservizi, cedimenti e accessi allo scavo',
+  ['Confrontare rilievi, elaborati e condizioni reali; chiarire i sottoservizi prima dello scavo.',
+   'Verificare stabilità, protezioni dei bordi, accessi e distanza di mezzi/materiali secondo il piano operativo.',
+   'Fermare la lavorazione in caso di sottoservizio inatteso o variazione delle condizioni.'],
+  'Come riconoscete un sottoservizio non censito e chi autorizza la ripresa?'),
+ 'quota': ('Caduta dall’alto e caduta di materiali',
+  ['Verificare accessi e protezioni collettive previste; controllare integrità e corretto utilizzo.',
+   'Dove previsti, verificare sistemi anticaduta, compatibilità e piano di recupero.',
+   'Delimitare le aree sottostanti e controllare vento e altre condizioni meteo.'],
+  'Come viene recuperata una persona sospesa e chi attiva il piano?'),
+ 'sollevamento': ('Carichi sospesi, interferenze e stabilità del mezzo',
+  ['Condividere piano di sollevamento, ruoli, segnali e confini dell’area.',
+   'Verificare accessori, portata nella configurazione reale, appoggi e condizioni meteo.',
+   'Impedire presenza di persone sotto carichi e nell’area di movimento.'],
+  'Qual è il segnale di arresto e chi lo può impartire?'),
+ 'spazi confinati': ('Atmosfere pericolose, accesso e soccorso',
+  ['Identificare e valutare l’ambiente prima dell’accesso; applicare la procedura dedicata.',
+   'Verificare isolamento, monitoraggi, ventilazione, comunicazioni e presidio esterno previsti.',
+   'Controllare organizzazione e mezzi di recupero; non improvvisare ingressi di soccorso.'],
+  'Quali condizioni impediscono l’accesso e come viene attivato il recupero?'),
+ 'incendio': ('Innesco, propagazione e gestione emergenze',
+  ['Verificare materiali combustibili, fonti d’innesco e autorizzazioni operative previste.',
+   'Identificare allarmi, vie di esodo, addetti e presidi; per BESS seguire il piano emergenze specifico.',
+   'Rispettare esclusioni e sorveglianza prevista per hot work; segnalare anomalie immediatamente.'],
+  'Dove vi radunate e quali informazioni date ai soccorsi?'),
+ 'viabilità': ('Investimento, retromarcia e interazione mezzi-pedoni',
+  ['Condividere percorsi, ingressi, sensi di marcia e punti di attraversamento.',
+   'Verificare separazione pedoni/mezzi, visibilità e assistenza alle manovre ove prevista.',
+   'Adeguare la velocità alle condizioni reali e fermarsi se il percorso non è libero.'],
+  'Chi verifica che l’area di manovra sia libera?'),
+ 'dpi': ('Scelta, compatibilità e uso dei DPI',
+  ['Associare i DPI al rischio e alla lavorazione effettiva, secondo la valutazione applicabile.',
+   'Controllare integrità, taglia, compatibilità e addestramento richiesto.',
+   'Segnalare immediatamente DPI mancanti, usurati o non idonei.'],
+  'Quale difetto vi porta a sostituire il DPI prima di iniziare?'),
+ 'ordine e pulizia': ('Inciampo, accessibilità e gestione materiali',
+  ['Mantenere sgombri passaggi, vie di esodo e accesso ai presidi.',
+   'Organizzare deposito materiali, cavi e rifiuti nelle aree previste.',
+   'Rimuovere o mettere in sicurezza sversamenti e ostacoli prima di proseguire.'],
+  'Chi gestisce il ripristino se trovate un passaggio ostruito?'),
+ 'documentale': ('Coerenza fra pianificazione e lavoro reale',
+  ['Verificare disponibilità e aggiornamento dei documenti applicabili alla lavorazione.',
+   'Confrontare personale, mezzi e sequenza operativa con quanto autorizzato.',
+   'Gestire le variazioni prima dell’avvio e chiarire i ruoli del controllo operativo.'],
+  'Quale variazione richiede una nuova verifica prima di lavorare?'),
+ 'ambientale': ('Sversamenti, rifiuti e protezione del suolo',
+  ['Identificare sostanze, punti di travaso e aree sensibili.',
+   'Verificare contenimenti, kit di intervento e segregazione dei rifiuti.',
+   'In caso di perdita fermare la fonte se sicuro, delimitare e attivare il flusso di segnalazione.'],
+  'Quali materiali sono disponibili per contenere una perdita?'),
+ 'altro': ('Riconoscimento del pericolo e gestione delle variazioni',
+  ['Descrivere la sequenza di lavoro e identificare i pericoli specifici.',
+   'Confermare protezioni, ruoli e comunicazioni prima dell’avvio.',
+   'Interrompere in caso di condizioni diverse da quelle valutate.'],
+  'Quale cambiamento rende necessario rivalutare il lavoro?')}
+
+
+def toolbox_text(theme, d, result):
+    title, points, question = TOOLBOX_CONTENT[theme]
+    reason = '; '.join(result['reasons'].get(theme, ['Tema scelto dall’utilizzatore']))
+    return (f"Sensibilizzazione — {theme.upper()}\nCantiere: {d['nome']} | {d['technology']} | Mese: {d['month']}\n"
+            f"Durata proposta: 5–10 minuti. Destinatari: lavoratori e preposti interessati.\n\n"
+            f"Perché questo tema: {reason}.\n\nObiettivo: {title}.\n\n"
+            'Apertura del preposto: «Prima di iniziare ripercorriamo i rischi di questa attività e le misure previste sul nostro sito».\n\n'
+            + '\n'.join(f'{i+1}. {p}' for i, p in enumerate(points))
+            + f'\n\nVerifica di comprensione: {question}\n'
+            'Chiusura: ogni lavoratore indica un pericolo e la misura da applicare; il preposto verifica sul campo.\n'
+            'Registrare data, argomento, partecipanti unici, osservazioni e azioni emerse.\n'
+            'Adattare il testo a PSC/POS, procedure e condizioni reali; il toolbox non sostituisce formazione e addestramento.')
+
+
+def action_plan(d, r):
     rows = []
-
-    if risk >= 80:
-        rows.append([
-            "Coordinamento HSE immediato",
-            "Critica",
-            "Site Manager / HSE",
-            "Immediata",
-            "Verbale e piano azioni"
-        ])
-
-    if technical_data["nc_detection_ratio"] >= 0.5:
-        rows.append([
-            "Analizzare indice di detection e ricorrenza NC",
-            "Alta",
-            "HSE Manager",
-            "48 ore",
-            "Analisi NC per tema e causa"
-        ])
-
-    if data["interference_level"] >= 6:
-        rows.append([
-            "Formalizzare matrice interferenze giornaliera",
-            "Alta",
-            "Construction Manager",
-            "Prima delle attività",
-            "Matrice e briefing firmato"
-        ])
-
-    if data["interference_level"] >= 8:
-        rows.append([
-            "Valutare separazione temporale o spaziale delle attività",
-            "Critica",
-            "Site Manager",
-            "Immediata",
-            "Programma lavori aggiornato"
-        ])
-
-    if data["company_hse"] < data["app"]:
-        rows.append([
-            "Rafforzare il presidio HSE delle imprese",
-            "Alta",
-            "Responsabili appaltatori",
-            "48 ore",
-            "Organigramma e presenze HSE"
-        ])
-
-    if data["crit_open"] > 0:
-        rows.append([
-            "Chiudere le criticità aperte prioritarie",
-            "Alta",
-            "HSE / Responsabile impresa",
-            "24-48 ore",
-            "Registro criticità aggiornato"
-        ])
-
-    if data["crit_late"] > 0:
-        rows.append([
-            "Analizzare i ritardi nella chiusura",
-            "Media",
-            "HSE Manager",
-            "7 giorni",
-            "Analisi cause e azioni correttive"
-        ])
-
-    if "elettrici" in data["activities"]:
-        rows.append([
-            "Verificare attività elettriche e LOTO",
-            "Alta",
-            "Preposto / HSE",
-            "24 ore",
-            "Checklist e autorizzazioni"
-        ])
-
-    if "scavi" in data["activities"]:
-        rows.append([
-            "Verificare sicurezza degli scavi",
-            "Alta",
-            "Preposto / HSE",
-            "24 ore",
-            "Checklist scavi"
-        ])
-
-    if "lavori in quota" in data["activities"]:
-        rows.append([
-            "Verificare lavori in quota",
-            "Alta",
-            "Preposto / HSE",
-            "24 ore",
-            "Checklist quota e PLE"
-        ])
-
-    if data["awareness_count"] == 0:
-        rows.append([
-            "Eseguire toolbox mirato",
-            "Alta",
-            "HSE / Preposto",
-            "Prima dell'attività",
-            "Registro presenze"
-        ])
-
-    if not rows:
-        rows.append([
-            "Mantenere il monitoraggio HSE",
-            "Media",
-            "HSE",
-            "7 giorni",
-            "Report ispezione"
-        ])
-
-    return pd.DataFrame(
-        rows,
-        columns=[
-            "Azione",
-            "Priorità",
-            "Owner suggerito",
-            "Scadenza",
-            "Evidenza richiesta"
-        ]
-    )
+    def add(priority, area, action, owner, when, evidence):
+        rows.append(dict(Priorità=priority, Area=area, Azione=action, Responsabile=owner,
+                         Termine=when, Evidenza=evidence, Stato='Da pianificare'))
+    if d['imminent_danger']:
+        add('P1', 'Pericolo attuale', 'Mettere in sicurezza la situazione e attivare i responsabili secondo le procedure di sito; verificare le condizioni per la ripresa.',
+            'Responsabili operativi competenti', 'Immediato', 'Verifica delle misure prima della ripresa')
+    for field, label in [('nc_items', 'NC formale'), ('crit_items', 'Criticità informale')]:
+        for i, item in enumerate(d[field]):
+            if item['status'] == 'Aperta':
+                add('P1' if item['severity'] == 'alta' or item['late'] else 'P2', item['theme'],
+                    f"{label} {i+1}: definire e attuare la correzione specifica. {item.get('note', '')}".strip(),
+                    'Responsabile impresa / preposto', 'Prima della lavorazione esposta' if item['severity'] == 'alta' else 'Entro 7 giorni (proposta)',
+                    'Chiusura documentata e verifica di efficacia')
+    for driver in sorted(r['drivers'][:6], key=lambda x: x['Contributo'], reverse=True):
+        area = driver['Area']
+        if driver['Contributo'] < 2:
+            continue
+        suggestions = {'Attività': ('Rivedere sequenze, mezzi e protezioni delle lavorazioni a maggior potenziale; verificare sul campo le misure.', 'Referenti operativi / preposti'),
+            'Interferenze': ('Separare nel tempo o nello spazio le attività interferenti; aggiornare layout e coordinamento.', 'Referenti imprese / coordinamento di cantiere'),
+            'Organizzazione': ('Chiarire responsabilità, interfacce fra imprese e supervisione delle aree operative.', 'Direzione cantiere'),
+            'Presidio e controlli': ('Rivedere copertura reale delle lavorazioni e piano ispezioni; verificarne qualità e attuazione.', 'Referente HSE / direzione cantiere')}
+        if area in suggestions:
+            action, owner = suggestions[area]
+            add('P2', area, action, owner, 'Entro 7 giorni (proposta)', 'Pianificazione condivisa e riscontro in campo')
+    awareness_map = {x['theme']: x for x in d['awareness']}
+    for theme, need in sorted(r['needs'].items(), key=lambda x: x[1], reverse=True):
+        existing = awareness_map.get(theme)
+        if need >= .5 and (not existing or existing['coverage'] is None or existing['coverage'] < 80):
+            add('P2', 'Sensibilizzazione: ' + theme,
+                'Organizzare un toolbox su ' + theme + '; collegamento: ' + '; '.join(r['reasons'][theme]),
+                'Preposto con supporto HSE', 'Prima della prossima attività pertinente', 'Partecipanti unici e verifica comprensione')
+    if not d['inspections']:
+        add('P2', 'Conoscenza del sito', 'Eseguire una prima verifica strutturata; il numero di anomalie zero non equivale a controllo efficace.',
+            'Referente HSE', 'Entro 7 giorni (proposta)', 'Report ispezione')
+    return rows
 
 
-# =========================================================
-# RIDUZIONE RISCHIO
-# =========================================================
-def local_reduce_risk(
-    data,
-    risk,
-    technical_data
-):
-    if risk > 80:
-        target = 80
-    elif risk > 60:
-        target = 60
-    elif risk > 40:
-        target = 40
+def executive_summary(d, r):
+    top = sorted(r['drivers'][:6], key=lambda x: x['Contributo'], reverse=True)[:3]
+    text = (f"{d['nome']} — {d['technology']}, {d['month']}: indice base {r['score']:.1f}/100 ({r['level']}). "
+            'I contributi principali sono ' + ', '.join(f"{x['Area']} ({x['Contributo']:.1f} punti)" for x in top) + '. ')
+    if r['floor']:
+        text += f"È attiva la soglia minima {r['floor']:.0f}: {r['floor_reason']}. "
+    text += f"Le sensibilizzazioni pertinenti riducono l’indice di {r['awareness_bonus']:.1f} punti. "
+    if r['missing']:
+        text += 'Qualità del dato: ' + ' '.join(r['missing'])
+    return text
+
+
+def simulations(d, r):
+    """Ricalcolo del medesimo modello: non previsione della riduzione reale del rischio."""
+    rows = []
+    changes = [
+      ('Chiusura verificata delle NC aperte', lambda x: [item.update(status='Chiusa nei tempi', late=False) for item in x['nc_items'] if item['status'] == 'Aperta']),
+      ('Chiusura verificata delle criticità aperte', lambda x: [item.update(status='Chiusa nei tempi', late=False) for item in x['crit_items'] if item['status'] == 'Aperta']),
+      ('Copertura HSE al 100%', lambda x: x.update(hse_coverage=100)),
+      ('Target ispettivo raggiunto', lambda x: x.update(inspections=max(x['inspections'], x['inspection_target']))),
+      ('Interferenza ridotta di 2 livelli', lambda x: x.update(interference_level=max(1, x['interference_level'] - 2))),
+      ('Toolbox pertinenti: 4 incontri per tema, copertura 100%', lambda x: x.update(awareness=[{'theme': t, 'count': 4, 'coverage': 100.} for t in topic_needs(x)[0]]))]
+    for label, apply in changes:
+        sample = deepcopy(d)
+        apply(sample)
+        result = calculate_risk(sample)
+        rows.append({'Scenario indipendente': label, 'Indice simulato': result['score'],
+                     'Riduzione punti': round(r['score'] - result['score'], 2),
+                     'Soglia residua': result['floor']})
+    return rows
+
+
+def local_advisor(question, d, r):
+    """Assistente deterministico: non è un LLM e non risponde a quesiti normativi."""
+    q = question.casefold()
+    if any(t in q for t in ['toolbox', 'sensibil', 'formaz']):
+        themes = sorted(r['needs'], key=r['needs'].get, reverse=True)[:3]
+        return 'Temi prioritari: ' + ', '.join(themes) + '.\n\n' + '\n\n'.join(
+            f"**{t}**: " + '; '.join(r['reasons'][t]) for t in themes)
+    if any(t in q for t in ['ridur', 'interven', 'miglior', 'azion']):
+        return '\n\n'.join(f"**{x['Area']}** — {x['Azione']}" for x in action_plan(d, r)[:8]) or 'Nessuna azione specifica generata: mantenere e verificare le misure previste.'
+    if any(t in q for t in ['hse', 'presidio', 'ispez']):
+        return (f"Copertura HSE dichiarata: {d['hse_coverage']:.0f}%. Ispezioni: {d['inspections']} / target {d['inspection_target']}. "
+                'Il numero di HSE non determina automaticamente adeguatezza: valutare presenza, competenze, turni e aree effettivamente seguite.')
+    return executive_summary(d, r) + '\n\nSono un assistente a regole: posso spiegare indice, azioni, presidio e temi dei toolbox; non interpreto liberamente domande normative.'
+
+
+def setting(key, default=''):
+    try:
+        return st.secrets.get(key, os.environ.get('HSE_' + key.upper(), default))
+    except Exception:
+        return os.environ.get('HSE_' + key.upper(), default)
+
+
+class HistoryStore:
+    """Sessione senza configurazione; SQLite locale o PostgreSQL opzionali.
+    Il database condiviso è accessibile solo dopo il gate applicativo in main().
+    Non si salvano risultati fidati da import: vengono ricalcolati dai dati validati.
+    """
+    def __init__(self, mode='session', url='', path='hse_history.sqlite3'):
+        self.mode, self.url, self.path = mode, url, path
+        if mode != 'session':
+            with self.connect() as conn:
+                conn.execute('CREATE TABLE IF NOT EXISTS hse_evaluations (id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+
+    def connect(self):
+        if self.mode == 'postgres':
+            import psycopg
+            return psycopg.connect(self.url, connect_timeout=10)
+        return sqlite3.connect(self.path, timeout=20)
+
+    def all(self):
+        if self.mode == 'session':
+            return deepcopy(st.session_state.setdefault('history_records', []))
+        with self.connect() as conn:
+            return [json.loads(row[0]) for row in conn.execute('SELECT payload FROM hse_evaluations').fetchall()]
+
+    def save_many(self, records):
+        if self.mode == 'session':
+            by_id = {x['id']: x for x in self.all()}
+            for record in records:
+                by_id.setdefault(record['id'], record)
+            st.session_state.history_records = list(by_id.values())
+            return
+        placeholder = '%s' if self.mode == 'postgres' else '?'
+        sql = f'INSERT INTO hse_evaluations (id, payload) VALUES ({placeholder}, {placeholder}) ON CONFLICT(id) DO NOTHING'
+        with self.connect() as conn:
+            for record in records:
+                conn.execute(sql, (record['id'], json.dumps(record, ensure_ascii=False, allow_nan=False)))
+
+
+def new_record(d, r):
+    return dict(id=str(uuid.uuid4()), saved_at=datetime.now(timezone.utc).isoformat(),
+                model_version=MODEL_VERSION, data=deepcopy(d), result=deepcopy(r))
+
+
+def backup_bytes(records):
+    return json.dumps(dict(schema_version=SCHEMA_VERSION, records=records), ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8')
+
+
+def parse_backup(raw):
+    if len(raw) > 20 * 1024 * 1024:
+        raise ValueError('Backup troppo grande: massimo 20 MB.')
+    content = json.loads(raw)
+    if not isinstance(content, dict) or content.get('schema_version') != SCHEMA_VERSION or not isinstance(content.get('records'), list):
+        raise ValueError('Formato backup non riconosciuto (schema 2 richiesto).')
+    if len(content['records']) > 10000:
+        raise ValueError('Massimo 10.000 valutazioni per importazione.')
+    records = []
+    seen = set()
+    for i, old in enumerate(content['records']):
+        if not isinstance(old, dict):
+            raise ValueError(f'Record {i+1} non valido.')
+        try:
+            ident = str(uuid.UUID(old['id']))
+            timestamp = datetime.fromisoformat(old['saved_at'])
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            timestamp = timestamp.astimezone(timezone.utc).isoformat()
+        except (KeyError, ValueError, TypeError, AttributeError):
+            raise ValueError(f'Identificativo/data non valido al record {i+1}.')
+        if ident in seen:
+            raise ValueError('Identificativi duplicati nel backup.')
+        seen.add(ident)
+        errors = validate_data(old.get('data'))
+        if errors:
+            raise ValueError(f'Record {i+1}: ' + '; '.join(errors[:5]))
+        if old.get('model_version') != MODEL_VERSION:
+            raise ValueError(f'Record {i+1}: versione modello non supportata; importare con la versione originale.')
+        d = old['data']
+        records.append(dict(id=ident, saved_at=timestamp, model_version=MODEL_VERSION,
+                            data=d, result=calculate_risk(d)))
+    return records
+
+
+def history_frame(records, latest_only=True):
+    rows = [dict(id=x['id'], Cantiere=x['data']['nome'], site=site_key(x['data']['nome']),
+                 Tecnologia=x['data']['technology'], Mese=x['data']['month'],
+                 Indice=x['result']['score'], Livello=x['result']['level'],
+                 Contestualizzato=x['result']['context_score'], Salvato=x['saved_at'], Versione=x['model_version']) for x in records]
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    frame = frame.sort_values(['Mese', 'Salvato', 'id'])
+    if latest_only:
+        frame = frame.drop_duplicates(['site', 'Mese', 'Versione'], keep='last')
+    return frame
+
+
+def word_report(d, r, theme=None):
+    doc = Document()
+    doc.add_heading('HSE Risk Platform | ' + ('Toolbox Talk' if theme else 'Report mensile'), 0)
+    doc.add_paragraph(f"{d['nome']} · {d['technology']} · {d['month']} · Modello {MODEL_VERSION}")
+    if theme:
+        for line in toolbox_text(theme, d, r).splitlines():
+            doc.add_paragraph(line)
     else:
-        target = 20
+        doc.add_paragraph(executive_summary(d, r))
+        doc.add_heading('Motivazioni e metodo', 1)
+        for line in r['explanations']:
+            doc.add_paragraph(line)
+        doc.add_heading('Azioni proposte', 1)
+        for row in action_plan(d, r):
+            doc.add_paragraph(f"{row['Priorità']} | {row['Area']} — {row['Azione']} | {row['Responsabile']} | {row['Termine']}")
+    buf = BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def excel_report(d, r, records):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        data_tables = {
+          'Sintesi': pd.DataFrame([{'Cantiere': d['nome'], 'Tecnologia': d['technology'], 'Mese': d['month'],
+             'Indice base': r['score'], 'Livello': r['level'], 'Indice contestualizzato': r['context_score'], 'Versione modello': MODEL_VERSION}]),
+          'Contributi': pd.DataFrame(r['drivers']), 'Action Plan': pd.DataFrame(action_plan(d, r)),
+          'NC formali': pd.DataFrame(d['nc_items']), 'Criticità informali': pd.DataFrame(d['crit_items']),
+          'Sensibilizzazioni': pd.DataFrame(r['awareness_details']),
+          'Metodo': pd.DataFrame({'Spiegazione': r['explanations']}),
+          'Scenari': pd.DataFrame(simulations(d, r)), 'Storico': history_frame(records),
+          'Input': pd.DataFrame([{'Campo': k, 'Valore': json.dumps(v, ensure_ascii=False)} for k, v in d.items()])}
+        from openpyxl.styles import PatternFill, Font, Alignment
+        for title, frame in data_tables.items():
+            frame.to_excel(writer, sheet_name=title, index=False)
+            sheet = writer.sheets[title]
+            sheet.freeze_panes = 'A2'
+            sheet.auto_filter.ref = sheet.dimensions
+            for cell in sheet[1]:
+                cell.fill = PatternFill('solid', fgColor='123047')
+                cell.font = Font(color='FFFFFF', bold=True)
+            for row in sheet.iter_rows(min_row=2):
+                for cell in row:
+                    # Non eseguire testo utente come formule Excel.
+                    if isinstance(cell.value, str) and cell.value.startswith(('=', '+', '-', '@')):
+                        cell.data_type = 's'
+                    cell.alignment = Alignment(vertical='top', wrap_text=True)
+            for col in sheet.columns:
+                sheet.column_dimensions[col[0].column_letter].width = min(65, max(15, max(len(str(c.value or '')) for c in col[:60]) + 2))
+            sheet.sheet_view.showGridLines = False
+        from openpyxl.chart import BarChart, Reference
+        sheet = writer.sheets['Contributi']
+        chart = BarChart()
+        chart.title = 'Contributi all’indice base'
+        chart.add_data(Reference(sheet, min_col=4, min_row=1, max_row=sheet.max_row), titles_from_data=True)
+        chart.set_categories(Reference(sheet, min_col=1, min_row=2, max_row=sheet.max_row))
+        sheet.add_chart(chart, 'F2')
+    return buffer.getvalue()
+
+
+def ppt_report(d, r):
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    pages = [('HSE Risk Platform', f"{d['nome']} | {d['technology']} | {d['month']}\nIndice {r['score']:.1f}/100 — {r['level']}\nModello gestionale {MODEL_VERSION}"),
+             ('Sintesi del mese', executive_summary(d, r)),
+             ('Contributi al punteggio', '\n'.join(f"{x['Area']}: {x['Contributo']:+.1f} punti" for x in r['drivers'])),
+             ('Priorità operative', '\n'.join(f"{x['Priorità']} · {x['Area']}: {x['Azione']}" for x in action_plan(d, r)[:5])),
+             ('Metodo e limiti', '\n'.join(r['explanations'][-3:]) + '\nIndice base per confronto; contestualizzato separato.\nNessuna validazione predittiva disponibile.')]
+    for theme in sorted(r['needs'], key=r['needs'].get, reverse=True)[:3]:
+        title, points, question = TOOLBOX_CONTENT[theme]
+        pages.append(('Toolbox | ' + theme, title + '\n\n' + '\n'.join(points) + '\n\n' + question))
+    paginated = []
+    for title, body in pages:
+        lines = []
+        for paragraph in body.splitlines():
+            lines.extend(textwrap.wrap(paragraph, width=102) or [''])
+        for start in range(0, len(lines), 15):
+            paginated.append((title + (' · continua' if start else ''), '\n'.join(lines[start:start+15])))
+    for title, body in paginated:
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        fill = slide.background.fill
+        fill.solid()
+        fill.fore_color.rgb = RGBColor.from_string('F3F6FA')
+        for top, height, text, size, color in [(0.55, 1., title, 30, '123047'), (1.7, 5., body, 18, '254559')]:
+            box = slide.shapes.add_textbox(Inches(.7), Inches(top), Inches(11.9), Inches(height))
+            tf = box.text_frame
+            tf.word_wrap = True
+            for i, line in enumerate(text.splitlines()):
+                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+                p.text = line
+                p.font.size = PptPt(size)
+                p.font.color.rgb = RGBColor.from_string(color)
+                p.space_after = PptPt(10)
+    buffer = BytesIO()
+    prs.save(buffer)
+    return buffer.getvalue()
 
-    levers = []
 
-    if technical_data["nc_detection_ratio"] >= 0.25:
-        levers.append(
-            "Ridurre la frequenza delle NC attraverso analisi "
-            "delle cause ricorrenti e azioni preventive."
-        )
-
-    if data["interference_level"] >= 6:
-        levers.append(
-            "Ridurre il livello di interferenza separando "
-            "le attività per area, orario o sequenza."
-        )
-
-    if data["company_hse"] < data["app"]:
-        levers.append(
-            "Aumentare la copertura HSE delle imprese "
-            "fino ad almeno un rapporto 1:1 con gli appaltatori."
-        )
-
-    if data["crit_open"] > 0:
-        levers.append(
-            "Chiudere le criticità aperte più rilevanti."
-        )
-
-    if data["awareness_count"] == 0:
-        levers.append(
-            "Eseguire toolbox mirati sulle attività critiche."
-        )
-
-    if data["num_nc"] > 0:
-        levers.append(
-            "Chiudere le NC ad alta gravità con verifica di efficacia."
-        )
-
-    if data["sub"] >= 5:
-        levers.append(
-            "Rafforzare il coordinamento dei subappaltatori."
-        )
-
-    if not levers:
-        levers.append(
-            "Mantenere controlli periodici e aggiornare "
-            "il rischio al cambio delle attività."
-        )
-
-    levers_text = "\n".join(
-        f"- {lever}"
-        for lever in levers
-    )
-
-    return f"""
-### Obiettivo suggerito
-
-Portare il Risk Index sotto **{target}**.
-
-### Leve principali
-
-{levers_text}
-
-### Strategia consigliata
-
-Agire prioritariamente su:
-
-- indice di detection;
-- interferenza tra attività;
-- copertura HSE delle imprese;
-- NC ad alta gravità;
-- criticità aperte;
-- sensibilizzazioni mirate.
-"""
-
-
-# =========================================================
-# HSE ADVISOR LOCALE
-# =========================================================
-def local_hse_advisor(
-    question,
-    data,
-    risk,
-    level,
-    actions_df,
-    technical_data
-):
-    query = question.lower()
-
-    if (
-        "interfer" in query
-        or "contemporan" in query
-    ):
-        return f"""
-Il livello di interferenza dichiarato è
-**{data['interference_level']}/10**.
-
-L'impatto tecnico calcolato è pari a
-**{technical_data['interference_score']} punti grezzi**.
-
-Il valore è corretto in funzione della tipologia
-e del numero delle attività in corso.
-
-Le azioni prioritarie sono:
-
-1. predisporre una matrice interferenziale;
-2. separare le attività per area o orario;
-3. effettuare un briefing tra imprese;
-4. aggiornare il programma giornaliero;
-5. definire chi coordina ogni interferenza.
-"""
-
-    if (
-        "hse" in query
-        or "appaltator" in query
-        or "copertura" in query
-    ):
-        return f"""
-Sono presenti **{data['company_hse']} HSE delle imprese**
-rispetto a **{data['app']} appaltatori**.
-
-La valutazione della copertura è:
-**{technical_data['hse_coverage_status']}**.
-
-Il correttivo applicato all'indice è pari a
-**{technical_data['hse_coverage_adjustment']} punti**.
-
-Un valore positivo è un malus.
-Un valore negativo è un bonus.
-"""
-
-    if (
-        "detection" in query
-        or "ispezion" in query
-        or "rapporto nc" in query
-    ):
-        return f"""
-L'indice di detection è pari a
-**{technical_data['nc_detection_ratio']} NC per ispezione**.
-
-Il parametro rappresenta il rapporto tra il numero
-totale delle NC e il numero delle ispezioni.
-
-Più il rapporto cresce, maggiore è il malus,
-perché aumenta la frequenza con cui vengono
-individuate anomalie durante i controlli.
-"""
-
-    if (
-        "24" in query
-        or "domani" in query
-        or "subito" in query
-    ):
-        top_actions = actions_df.head(5)["Azione"].tolist()
-
-        actions_text = "\n".join(
-            f"{index + 1}. {action}"
-            for index, action in enumerate(top_actions)
-        )
-
-        return f"""
-Nelle prossime 24 ore suggerisco:
-
-{actions_text}
-"""
-
-    if (
-        "principale" in query
-        or "rischio" in query
-    ):
-        top_actions = actions_df.head(3)["Azione"].tolist()
-
-        actions_text = "\n".join(
-            f"- {action}"
-            for action in top_actions
-        )
-
-        return f"""
-Il rischio principale deriva dalla combinazione di:
-
-- attività critiche;
-- livello di interferenza {data['interference_level']}/10;
-- indice di detection
-  {technical_data['nc_detection_ratio']};
-- copertura HSE
-  {data['company_hse']} su {data['app']} appaltatori;
-- criticità aperte e NC.
-
-Azioni prioritarie:
-
-{actions_text}
-"""
-
-    if (
-        "ridurre" in query
-        or "abbassare" in query
-    ):
-        return local_reduce_risk(
-            data,
-            risk,
-            technical_data
-        )
-
-    if (
-        "bonus stop" in query
-        or "stop work" in query
-        or "stopwork" in query
-    ):
-        return f"""
-Sono stati registrati **{data['stopworks']} Stop Work**.
-
-Nel modello gli Stop Work sono considerati esclusivamente
-come un segnale positivo di cultura della sicurezza:
-il bonus applicato è **-{technical_data['stop_work_bonus']} punti**.
-
-Il beneficio è volutamente limitato a un massimo di
-**-{STOP_WORK_BONUS_CAP} punti**, così non può compensare
-NC, criticità o interferenze rilevanti.
-"""
-
-    if (
-        "fermare" in query
-        or "stop" in query
-    ):
-        if level in ["Alto", "Critico"]:
-            return (
-                "Con livello Alto o Critico valuterei la sospensione "
-                "selettiva delle attività non controllate, in particolare "
-                "in presenza di NC ad alta gravità o interferenze elevate."
-            )
-
-        return (
-            "Non emerge automaticamente la necessità di fermare "
-            "le attività, ma deve essere applicato lo Stop Work "
-            "in presenza di una condizione non controllata."
-        )
-
-    return f"""
-Il report presenta un livello **{level}**
-con Risk Index **{round(risk)}/100**.
-
-Per interpretarlo considera prioritariamente:
-
-- NC e relativa gravità;
-- indice di detection;
-- rapporto tra ispezioni e NC;
-- attività e livello di interferenza;
-- copertura HSE delle imprese;
-- criticità aperte;
-- sensibilizzazioni mirate.
-
-Prova a chiedere, ad esempio:
-
-- Qual è il rischio principale?
-- Come posso ridurre il rischio?
-- La copertura HSE è sufficiente?
-- Come viene calcolata l'interferenza?
-- Cosa devo fare nelle prossime 24 ore?
-"""
-
-
-# =========================================================
-# GRAFICO DRIVER BONUS / MALUS
-# =========================================================
-def create_driver_chart(driver_df):
-    chart_df = driver_df.copy()
-
-    chart_df["Tipo"] = chart_df["Valore"].apply(
-        lambda value:
-        "Malus"
-        if value > 0
-        else "Bonus"
-        if value < 0
-        else "Neutro"
-    )
-
-    chart_df["Etichetta"] = chart_df["Valore"].apply(
-        lambda value: f"{value:+.1f}"
-    )
-
-    bars = (
-        alt.Chart(chart_df)
-        .mark_bar(cornerRadiusEnd=4)
-        .encode(
-            x=alt.X(
-                "Valore:Q",
-                title="Impatto sull'indice di rischio"
-            ),
-            y=alt.Y(
-                "Driver:N",
-                sort="-x",
-                title=None
-            ),
-            color=alt.Color(
-                "Tipo:N",
-                scale=alt.Scale(
-                    domain=[
-                        "Malus",
-                        "Bonus",
-                        "Neutro"
-                    ],
-                    range=[
-                        "#D62728",
-                        "#2CA02C",
-                        "#A0A0A0"
-                    ]
-                ),
-                legend=alt.Legend(
-                    title="Impatto"
-                )
-            ),
-            tooltip=[
-                alt.Tooltip(
-                    "Driver:N",
-                    title="Driver"
-                ),
-                alt.Tooltip(
-                    "Valore:Q",
-                    title="Impatto",
-                    format=".1f"
-                ),
-                alt.Tooltip(
-                    "Tipo:N",
-                    title="Tipo"
-                )
-            ]
-        )
-    )
-
-    zero_line = (
-        alt.Chart(
-            pd.DataFrame({"zero": [0]})
-        )
-        .mark_rule(
-            color="#444444",
-            strokeWidth=1
-        )
-        .encode(
-            x="zero:Q"
-        )
-    )
-
-    labels = (
-        alt.Chart(chart_df)
-        .mark_text(
-            align="left",
-            baseline="middle",
-            dx=5
-        )
-        .encode(
-            x="Valore:Q",
-            y=alt.Y(
-                "Driver:N",
-                sort="-x"
-            ),
-            text="Etichetta:N"
-        )
-    )
-
-    return (
-        bars + zero_line + labels
-    ).properties(
-        height=420
-    )
-
-
-
-# =========================================================
-# HSE SCORECARD
-# =========================================================
-def clamp(value, minimum=0.0, maximum=10.0):
-    return max(minimum, min(maximum, value))
-
-
-def generate_hse_scorecard(data, risk, technical_data):
-    """Genera una scorecard sintetica su scala 0-10."""
-    organization = 10.0
-    organization -= min(data["sub"] * 0.35, 2.0)
-    organization -= max(technical_data["hse_coverage_adjustment"], 0) / 6
-    organization += min(max(-technical_data["hse_coverage_adjustment"], 0) / 8, 1.0)
-
-    planning = 10.0
-    planning -= max(data["interference_level"] - 3, 0) * 0.55
-    planning -= 1.2 if len(data["activities"]) >= 3 else 0
-    planning -= 0.8 if data["crit_late"] > 0 else 0
-
-    operational = 10.0
-    operational -= min(technical_data["nc_detection_ratio"] * 3.2, 4.0)
-    operational -= min(data["crit_open"] * 0.45, 2.5)
-    operational -= min(sum(1 for item in data["nc_items"] if item["severity"] == "alta") * 0.8, 2.0)
-
-    culture = 6.0
-    culture += min(data["awareness_count"] * 0.25, 2.0)
-    culture += min(data["stopworks"] * 0.30, 1.5)
-    culture += min(len(data["awareness_types"]) * 0.18, 0.8)
-    culture -= 1.0 if data["awareness_count"] == 0 else 0
-
-    coordination = 10.0
-    coordination -= max(data["interference_level"] - 2, 0) * 0.55
-    coordination -= min(max(len(data["activities"]) - 2, 0) * 0.45, 1.8)
-    coordination -= 0.8 if data["sub"] >= 5 else 0
-
-    rows = [
-        ("Organizzazione", organization, "Adeguatezza della struttura, complessità imprese e copertura HSE."),
-        ("Pianificazione", planning, "Programmazione delle attività, gestione delle interferenze e puntualità del follow-up."),
-        ("Controllo operativo", operational, "Esito dei controlli, frequenza delle NC e criticità ancora aperte."),
-        ("Cultura HSE", culture, "Sensibilizzazioni, partecipazione e utilizzo responsabile dello Stop Work."),
-        ("Coordinamento", coordination, "Gestione della contemporaneità, delle imprese e delle lavorazioni interferenti."),
-    ]
-
-    scorecard_df = pd.DataFrame(rows, columns=["Area", "Punteggio", "Motivazione"])
-    scorecard_df["Punteggio"] = scorecard_df["Punteggio"].apply(lambda value: round(clamp(value), 1))
-    scorecard_df["Stelle"] = scorecard_df["Punteggio"].apply(
-        lambda value: "★" * max(1, min(5, round(value / 2))) + "☆" * (5 - max(1, min(5, round(value / 2))))
-    )
-    overall = round(scorecard_df["Punteggio"].mean(), 1)
-    return scorecard_df, overall
-
-
-# =========================================================
-# HSE TOOLKIT - CHECKLIST WORD
-# =========================================================
 CHECKLIST_LIBRARY = {
     "Controlli generali pre-attività": [
         "L'attività è inserita nel programma lavori / sinottico aggiornato?",
@@ -2183,1064 +883,418 @@ def generate_checklist_word(data, selected_sections):
     return buffer
 
 
-# =========================================================
-# POWERPOINT
-# =========================================================
-def generate_ppt(
-    data,
-    risk,
-    level,
-    driver_df,
-    action_plan_df,
-    summary,
-    root_cause,
-    toolbox,
-    technical_data,
-    scorecard_df,
-    scorecard_overall
-):
-    prs = Presentation()
 
-    slide = prs.slides.add_slide(
-        prs.slide_layouts[0]
-    )
-
-    slide.shapes.title.text = "HSE Risk Report"
-
-    slide.placeholders[1].text = (
-        f"Cantiere: {data['nome']}\n"
-        f"Data: {datetime.now().strftime('%d/%m/%Y')}"
-    )
-
-    slide = prs.slides.add_slide(
-        prs.slide_layouts[1]
-    )
-
-    slide.shapes.title.text = "Executive Summary"
-
-    slide.placeholders[1].text = (
-        summary
-        .replace("**", "")
-        .replace("###", "")
-    )[:1700]
-
-    slide = prs.slides.add_slide(
-        prs.slide_layouts[1]
-    )
-
-    slide.shapes.title.text = "Sintesi del rischio"
-
-    slide.placeholders[1].text = (
-        f"Risk Index: {round(risk)} / 100\n"
-        f"Livello: {level}\n\n"
-        f"Fase: {data['fase']}\n"
-        f"Indice di detection: "
-        f"{technical_data['nc_detection_ratio']}\n"
-        f"Interferenza: {data['interference_level']}/10\n"
-        f"HSE imprese: {data['company_hse']}\n"
-        f"Appaltatori: {data['app']}\n"
-        f"Copertura HSE: "
-        f"{technical_data['hse_coverage_status']}\n"
-        f"Attività: "
-        f"{', '.join(data['activities']) if data['activities'] else 'Nessuna'}"
-    )
-
-    slide = prs.slides.add_slide(
-        prs.slide_layouts[5]
-    )
-
-    slide.shapes.title.text = "Driver del rischio"
-
-    table = slide.shapes.add_table(
-        len(driver_df) + 1,
-        3,
-        Inches(0.6),
-        Inches(1.3),
-        Inches(8.5),
-        Inches(5)
-    ).table
-
-    table.cell(0, 0).text = "Driver"
-    table.cell(0, 1).text = "Impatto"
-    table.cell(0, 2).text = "Tipo"
-
-    for index, row in driver_df.iterrows():
-        value = float(row["Valore"])
-
-        impact_type = (
-            "Malus"
-            if value > 0
-            else "Bonus"
-            if value < 0
-            else "Neutro"
-        )
-
-        table.cell(
-            index + 1,
-            0
-        ).text = str(row["Driver"])
-
-        table.cell(
-            index + 1,
-            1
-        ).text = f"{value:+.1f}"
-
-        table.cell(
-            index + 1,
-            2
-        ).text = impact_type
-
-    slide = prs.slides.add_slide(
-        prs.slide_layouts[1]
-    )
-
-    slide.shapes.title.text = "Action Plan"
-
-    action_text = ""
-
-    for _, row in action_plan_df.head(8).iterrows():
-        action_text += (
-            f"{row['Priorità']} - "
-            f"{row['Azione']} - "
-            f"{row['Scadenza']}\n"
-        )
-
-    slide.placeholders[1].text = action_text[:1800]
-
-    slide = prs.slides.add_slide(
-        prs.slide_layouts[1]
-    )
-
-    slide.shapes.title.text = "Root Cause Analysis"
-
-    slide.placeholders[1].text = (
-        root_cause
-        .replace("###", "")
-        .replace("**", "")
-    )[:1800]
-
-    slide = prs.slides.add_slide(
-        prs.slide_layouts[1]
-    )
-
-    slide.shapes.title.text = "Toolbox Talk"
-
-    slide.placeholders[1].text = (
-        toolbox
-        .replace("###", "")
-        .replace("**", "")
-    )[:1800]
-
-    slide = prs.slides.add_slide(
-        prs.slide_layouts[5]
-    )
-
-    slide.shapes.title.text = "HSE Scorecard"
-
-    score_table = slide.shapes.add_table(
-        len(scorecard_df) + 2,
-        4,
-        Inches(0.6),
-        Inches(1.25),
-        Inches(8.6),
-        Inches(4.8)
-    ).table
-
-    score_table.cell(0, 0).text = "Area"
-    score_table.cell(0, 1).text = "Stelle"
-    score_table.cell(0, 2).text = "Punteggio"
-    score_table.cell(0, 3).text = "Motivazione"
-
-    for index, row in scorecard_df.iterrows():
-        score_table.cell(index + 1, 0).text = str(row["Area"])
-        score_table.cell(index + 1, 1).text = str(row["Stelle"])
-        score_table.cell(index + 1, 2).text = f"{float(row['Punteggio']):.1f} / 10"
-        score_table.cell(index + 1, 3).text = str(row["Motivazione"])
-
-    last_row = len(scorecard_df) + 1
-    score_table.cell(last_row, 0).text = "VALUTAZIONE COMPLESSIVA"
-    score_table.cell(last_row, 1).text = ""
-    score_table.cell(last_row, 2).text = f"{scorecard_overall:.1f} / 10"
-    score_table.cell(last_row, 3).text = "Media delle cinque aree della scorecard."
-
-    return prs
-
-
-# =========================================================
-# EXCEL
-# =========================================================
-def generate_excel(
-    data,
-    risk,
-    level,
-    driver_df,
-    actions_df,
-    action_plan_df,
-    explanations_df,
-    summary,
-    root_cause,
-    toolbox,
-    reduce_risk,
-    technical_data,
-    scorecard_df,
-    scorecard_overall
-):
-    buffer = BytesIO()
-
-    summary_df = pd.DataFrame([{
-        "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "Cantiere": data["nome"],
-        "Risk Index": round(risk, 1),
-        "Livello": level,
-        "Fase": data["fase"],
-        "Ispezioni": data["inspections"],
-        "NC": data["num_nc"],
-        "Indice di detection":
-            technical_data["nc_detection_ratio"],
-        "Interferenza attività":
-            data["interference_level"],
-        "Interference score":
-            technical_data["interference_score"],
-        "Appaltatori": data["app"],
-        "Subappaltatori": data["sub"],
-        "HSE imprese": data["company_hse"],
-        "Copertura HSE":
-            technical_data["hse_coverage_status"],
-        "Correttivo copertura HSE":
-            technical_data["hse_coverage_adjustment"],
-        "Stop Work": data["stopworks"],
-        "Criticità aperte": data["crit_open"],
-        "Criticità in tempo": data["crit_ontime"],
-        "Criticità in ritardo": data["crit_late"],
-        "Sensibilizzazioni":
-            data["awareness_count"],
-        "Tipologie attività":
-            ", ".join(data["activities"]),
-        "Tipologie sensibilizzazioni":
-            ", ".join(data["awareness_types"])
-    }])
-
-    local_outputs_df = pd.DataFrame([
-        {
-            "Sezione": "Executive Summary",
-            "Testo": summary
-        },
-        {
-            "Sezione": "Root Cause Analysis",
-            "Testo": root_cause
-        },
-        {
-            "Sezione": "Toolbox Talk",
-            "Testo": toolbox
-        },
-        {
-            "Sezione": "Come ridurre il rischio",
-            "Testo": reduce_risk
-        }
-    ])
-
-    nc_df = pd.DataFrame(
-        data["nc_items"]
-    )
-
-    with pd.ExcelWriter(
-        buffer,
-        engine="openpyxl"
-    ) as writer:
-        summary_df.to_excel(
-            writer,
-            sheet_name="Sintesi",
-            index=False
-        )
-
-        driver_df.to_excel(
-            writer,
-            sheet_name="Driver rischio",
-            index=False
-        )
-
-        actions_df.to_excel(
-            writer,
-            sheet_name="Azioni base",
-            index=False
-        )
-
-        action_plan_df.to_excel(
-            writer,
-            sheet_name="Action Plan",
-            index=False
-        )
-
-        explanations_df.to_excel(
-            writer,
-            sheet_name="Motivazione",
-            index=False
-        )
-
-        local_outputs_df.to_excel(
-            writer,
-            sheet_name="Output locali",
-            index=False
-        )
-
-        nc_df.to_excel(
-            writer,
-            sheet_name="NC dettaglio",
-            index=False
-        )
-
-        scorecard_export_df = scorecard_df.copy()
-        scorecard_export_df.loc[len(scorecard_export_df)] = {
-            "Area": "Valutazione complessiva",
-            "Punteggio": scorecard_overall,
-            "Motivazione": "Media delle cinque aree della scorecard",
-            "Stelle": ""
-        }
-        scorecard_export_df.to_excel(
-            writer,
-            sheet_name="HSE Scorecard",
-            index=False
-        )
-
-    buffer.seek(0)
-
-    return buffer
-
-
-# =========================================================
-# ESECUZIONE CALCOLO E SESSION STATE
-# =========================================================
-def run_calculation(data):
-    (
-        risk,
-        level,
-        details,
-        explanations,
-        technical_data
-    ) = calculate_risk(data)
-
-    base_actions = generate_base_actions(
-        data,
-        risk,
-        level,
-        technical_data
-    )
-
-    driver_df = pd.DataFrame(
-        details,
-        columns=[
-            "Driver",
-            "Valore"
-        ]
-    )
-
-    actions_df = pd.DataFrame(
-        base_actions,
-        columns=[
-            "Priorità",
-            "Azione"
-        ]
-    )
-
-    explanations_df = pd.DataFrame(
-        explanations,
-        columns=[
-            "Motivazione"
-        ]
-    )
-
-    summary = local_executive_summary(
-        data,
-        risk,
-        level,
-        driver_df,
-        technical_data
-    )
-
-    root_cause = local_root_cause(
-        data,
-        risk,
-        level,
-        technical_data,
-        driver_df
-    )
-
-    toolbox = local_toolbox_talk(
-        data,
-        technical_data
-    )
-
-    action_plan_df = local_action_plan(
-        data,
-        risk,
-        level,
-        technical_data
-    )
-
-    reduce_risk = local_reduce_risk(
-        data,
-        risk,
-        technical_data
-    )
-
-    scorecard_df, scorecard_overall = generate_hse_scorecard(
-        data,
-        risk,
-        technical_data
-    )
-
-    st.session_state.report = {
-        "data": data,
-        "risk": risk,
-        "level": level,
-        "driver_df": driver_df,
-        "actions_df": actions_df,
-        "explanations_df": explanations_df,
-        "summary": summary,
-        "root_cause": root_cause,
-        "toolbox": toolbox,
-        "action_plan_df": action_plan_df,
-        "reduce_risk": reduce_risk,
-        "technical_data": technical_data,
-        "scorecard_df": scorecard_df,
-        "scorecard_overall": scorecard_overall
-    }
-
-    st.session_state.calcolo_effettuato = True
-    st.session_state.advisor_answer = ""
-
-
-if "calcolo_effettuato" not in st.session_state:
-    st.session_state.calcolo_effettuato = False
-
-if "advisor_answer" not in st.session_state:
-    st.session_state.advisor_answer = ""
-
-
-# =========================================================
-# INTERFACCIA
-# =========================================================
-st.title("🦺 HSE Risk Platform AI Locale")
-
-st.caption(
-    "Risk assessment HSE con Executive Summary, Root Cause, "
-    "Toolbox Talk, Action Plan e Advisor locale gratuito."
-)
-
-st.success(
-    "Modalità gratuita attiva: nessuna API key richiesta."
-)
-
-
-with st.sidebar:
-    st.header("📋 Dati cantiere")
-
-    nome = st.text_input(
-        "Nome cantiere",
-        value="Cantiere Demo",
-        help=(
-            "Identifica il sito o il progetto. Il nome viene riportato "
-            "nei report PowerPoint, Excel e nella checklist Word."
-        )
-    )
-
-    fase = st.selectbox(
-        "Fase",
-        [
-            "cantierizzazione",
-            "costruzione",
-            "commissioning",
-            "punch list"
-        ],
-        help=(
-            "La fase non aumenta direttamente il Risk Index. "
-            "Serve per contestualizzare gli output e premiare "
-            "le sensibilizzazioni coerenti con il momento operativo."
-        )
-    )
-
-    st.divider()
-
-    # -----------------------------------------------------
-    # CONTROLLI E NC
-    # -----------------------------------------------------
-    st.header("🔍 Controlli e NC")
-
-    inspections = st.number_input(
-        "Numero ispezioni",
-        min_value=0,
-        max_value=1000,
-        value=10,
-        help=(
-            "Numero di ispezioni HSE eseguite nel periodo analizzato. "
-            "Influisce sull'indice di detection e sul rapporto ispezioni/NC."
-        )
-    )
-
-    num_nc = st.number_input(
-        "Numero totale NC",
-        min_value=0,
-        max_value=300,
-        value=0,
-        help=(
-            "Numero complessivo di non conformità rilevate. "
-            "Le NC dettagliate ricevono un peso per tema e gravità; "
-            "quelle non dettagliate ricevono un peso prudenziale medio."
-        )
-    )
-
-    nc_items = []
-
-    nc_count_detail = st.number_input(
-        "Quante NC vuoi dettagliare?",
-        min_value=0,
-        max_value=20,
-        value=min(num_nc, 3),
-        help=(
-            "Permette di specificare tema e gravità delle NC principali. "
-            "Il numero non può superare il totale delle NC inserite."
-        )
-    )
-
-    for index in range(nc_count_detail):
-        col1, col2 = st.columns(2)
-
-        with col1:
-            theme = st.selectbox(
-                f"Tema NC {index + 1}",
-                list(NC_THEME_WEIGHTS.keys()),
-                key=f"nc_theme_{index}",
-                help=(
-                    "Il tema determina il peso tecnico della NC. "
-                    "Temi ad alto potenziale, come elettrico o spazi "
-                    "confinati, hanno un impatto maggiore."
-                )
-            )
-
-        with col2:
-            severity = st.selectbox(
-                f"Gravità NC {index + 1}",
-                [
-                    "bassa",
-                    "media",
-                    "alta"
-                ],
-                key=f"nc_severity_{index}",
-                help=(
-                    "La gravità integra il peso del tema: bassa +3, "
-                    "media +8, alta +16 punti grezzi."
-                )
-            )
-
-        nc_items.append({
-            "theme": theme,
-            "severity": severity
-        })
-
-    st.divider()
-
-    # -----------------------------------------------------
-    # STOP WORK E CRITICITÀ
-    # -----------------------------------------------------
-    st.header("⛔ Stop Work e criticità")
-
-    stopworks = st.number_input(
-        "Stop Work",
-        min_value=0,
-        max_value=100,
-        value=0,
-        help=(
-            "Gli Stop Work sono considerati esclusivamente come bonus "
-            "di cultura della sicurezza: -1,5 punti ciascuno, con un "
-            "massimo di -6 punti complessivi."
-        )
-    )
-
-    crit_open = st.number_input(
-        "Criticità aperte",
-        min_value=0,
-        max_value=200,
-        value=0,
-        help=(
-            "Criticità ancora da risolvere. Hanno il peso maggiore "
-            "nel driver criticità perché rappresentano esposizioni attive."
-        )
-    )
-
-    crit_ontime = st.number_input(
-        "Criticità risolte in tempo",
-        min_value=0,
-        max_value=200,
-        value=0,
-        help=(
-            "Criticità chiuse entro la scadenza. Mantengono un peso "
-            "residuo limitato per rappresentare l'evento rilevato."
-        )
-    )
-
-    crit_late = st.number_input(
-        "Criticità risolte in ritardo",
-        min_value=0,
-        max_value=200,
-        value=0,
-        help=(
-            "Criticità chiuse oltre la scadenza. Generano un malus "
-            "per evidenziare debolezze nel follow-up."
-        )
-    )
-
-    st.divider()
-
-    # -----------------------------------------------------
-    # ORGANIZZAZIONE
-    # -----------------------------------------------------
-    st.header("🏗️ Organizzazione")
-
-    app = st.number_input(
-        "Numero appaltatori",
-        min_value=0,
-        max_value=100,
-        value=1,
-        help=(
-            "Numero di imprese appaltatrici presenti. Contribuisce "
-            "alla complessità organizzativa e al calcolo della copertura HSE."
-        )
-    )
-
-    sub = st.number_input(
-        "Numero subappaltatori",
-        min_value=0,
-        max_value=100,
-        value=0,
-        help=(
-            "Numero di imprese subappaltatrici presenti. Ha un peso "
-            "maggiore degli appaltatori nella complessità organizzativa."
-        )
-    )
-
-    company_hse = st.number_input(
-        "Numero HSE delle imprese",
-        min_value=0,
-        max_value=100,
-        value=1,
-        help=(
-            "Il valore viene confrontato con il numero "
-            "degli appaltatori. Rapporto 1:1 neutro; "
-            "copertura inferiore genera malus; "
-            "copertura superiore genera bonus."
-        )
-    )
-
-    st.divider()
-
-    # -----------------------------------------------------
-    # ATTIVITÀ
-    # -----------------------------------------------------
-    st.header("⚙️ Attività in corso")
-
-    activities = st.multiselect(
-        "Tipologie attività presenti",
-        list(ACTIVITY_WEIGHTS.keys()),
-        default=["civili"],
-        help=(
-            "Seleziona tutte le lavorazioni effettivamente in corso. "
-            "Tipologia, numero e contemporaneità incidono sul rischio "
-            "e sulle correlazioni con NC e sensibilizzazioni."
-        )
-    )
-
-    interference_level = st.slider(
-        "Livello di interferenza delle attività",
-        min_value=1,
-        max_value=10,
-        value=3,
-        step=1,
-        help=(
-            "1 indica interferenze minime; "
-            "10 indica interferenze molto elevate. "
-            "L'impatto è corretto in base alla tipologia "
-            "e al numero delle attività selezionate."
-        )
-    )
-
-    if interference_level <= 3:
-        st.caption("🟢 Interferenza bassa")
-    elif interference_level <= 5:
-        st.caption("🟡 Interferenza moderata")
-    elif interference_level <= 7:
-        st.caption("🟠 Interferenza elevata")
-    else:
-        st.caption("🔴 Interferenza molto elevata")
-
-    st.divider()
-
-    # -----------------------------------------------------
-    # SENSIBILIZZAZIONI
-    # -----------------------------------------------------
-    st.header("🧠 Sensibilizzazioni")
-
-    awareness_count = st.number_input(
-        "Numero sensibilizzazioni effettuate",
-        min_value=0,
-        max_value=1000,
-        value=0,
-        help=(
-            "Numero complessivo di toolbox o sensibilizzazioni eseguite "
-            "nel periodo. La continuità genera un bonus limitato."
-        )
-    )
-
-    awareness_types = st.multiselect(
-        "Tipologie sensibilizzazioni effettuate",
-        list(AWARENESS_BONUS.keys()),
-        help=(
-            "La tipologia determina il bonus e permette di verificare "
-            "la coerenza con le attività presenti e con la fase del cantiere."
-        )
-    )
-
-    st.divider()
-
-    calcola = st.button(
-        "Calcola rischio",
-        type="primary",
-        use_container_width=True
-    )
-
-
-# =========================================================
-# AVVIO DEL CALCOLO
-# =========================================================
-if calcola:
-    data = {
-        "nome": nome,
-        "fase": fase,
-        "inspections": inspections,
-        "num_nc": num_nc,
-        "nc_items": nc_items,
-        "stopworks": stopworks,
-        "crit_open": crit_open,
-        "crit_ontime": crit_ontime,
-        "crit_late": crit_late,
-        "app": app,
-        "sub": sub,
-        "company_hse": company_hse,
-        "activities": normalize_list(
-            activities
-        ),
-        "interference_level": interference_level,
-        "awareness_count": awareness_count,
-        "awareness_types": normalize_list(
-            awareness_types
-        )
-    }
-
-    run_calculation(data)
-
-
-if not st.session_state.calcolo_effettuato:
-    st.info(
-        "Compila i dati nella sidebar e clicca su "
-        "**Calcola rischio**."
-    )
-    st.stop()
-
-
-# =========================================================
-# LETTURA REPORT SALVATO
-# =========================================================
-report = st.session_state.report
-
-data = report["data"]
-risk = report["risk"]
-level = report["level"]
-driver_df = report["driver_df"]
-actions_df = report["actions_df"]
-explanations_df = report["explanations_df"]
-summary = report["summary"]
-root_cause = report["root_cause"]
-toolbox = report["toolbox"]
-action_plan_df = report["action_plan_df"]
-reduce_risk = report["reduce_risk"]
-technical_data = report["technical_data"]
-scorecard_df = report["scorecard_df"]
-scorecard_overall = report["scorecard_overall"]
-
-
-# =========================================================
-# KPI
-# =========================================================
-col1, col2, col3, col4, col5 = st.columns(5)
-
-col1.metric(
-    "Risk Index",
-    f"{round(risk)} / 100"
-)
-
-col2.metric(
-    "Livello",
-    level
-)
-
-col3.metric(
-    "Indice detection",
-    technical_data["nc_detection_ratio"]
-)
-
-col4.metric(
-    "Interferenza",
-    f"{data['interference_level']} / 10"
-)
-
-col5.metric(
-    "Copertura HSE",
-    f"{data['company_hse']} / {data['app']}"
-)
-
-st.divider()
-
-
-# =========================================================
-# GRAFICO E SUMMARY
-# =========================================================
-left, right = st.columns(
-    [1.3, 1]
-)
-
-with left:
-    st.subheader("📊 Impatto dei driver sul Risk Index")
-
-    st.caption(
-        "Le colonne rosse aumentano il rischio. "
-        "Le colonne verdi rappresentano bonus che riducono l'indice."
-    )
-
-    chart = create_driver_chart(
-        driver_df
-    )
-
-    st.altair_chart(
-        chart,
-        use_container_width=True
-    )
-
-with right:
-    st.subheader("🤖 Executive Summary locale")
-
-    st.markdown(summary)
-
-    if (
-        data["awareness_count"] > 0
-        and not data["awareness_types"]
-    ):
-        st.warning(
-            "Hai inserito sensibilizzazioni senza tipologia. "
-            "Seleziona le tipologie per valorizzarle nel calcolo."
-        )
-
-    if (
-        data["num_nc"]
-        > len(data["nc_items"])
-    ):
-        st.warning(
-            f"Hai indicato {data['num_nc']} NC totali, "
-            f"ma ne hai dettagliate solo "
-            f"{len(data['nc_items'])}. "
-            "Alle NC non dettagliate viene applicato "
-            "un peso prudenziale medio."
-        )
-
-    if data["company_hse"] < data["app"]:
-        st.error(
-            "La copertura HSE delle imprese è inferiore "
-            "al numero degli appaltatori."
-        )
-
-    if data["interference_level"] >= 8:
-        st.error(
-            "Il livello di interferenza dichiarato "
-            "è molto elevato."
-        )
-
-
-st.divider()
-
-
-# =========================================================
-# TAB
-# =========================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
-    "🎯 Azioni e alert",
-    "📋 Action Plan",
-    "🔍 Root Cause",
-    "🧰 Toolbox Talk",
-    "📉 Riduci rischio",
-    "🧮 Dettaglio calcolo",
-    "💬 HSE Advisor",
-    "⭐ HSE Scorecard",
-    "📑 HSE Toolkit",
-    "📤 Export"
-])
-
-with tab1:
-    st.subheader("Azioni e alert generati dal motore")
-    st.dataframe(actions_df, use_container_width=True, hide_index=True)
-
-with tab2:
-    st.subheader("Action Plan operativo")
-    st.dataframe(action_plan_df, use_container_width=True, hide_index=True)
-
-with tab3:
-    st.subheader("Root Cause Analysis per categorie")
-    st.caption("La motivazione del punteggio è organizzata per area e collegata ai contributi effettivi dei driver.")
-    st.markdown(root_cause)
-
-with tab4:
-    st.subheader("Toolbox Talk locale")
-    st.markdown(toolbox)
-
-with tab5:
-    st.subheader("Come ridurre il rischio")
-    st.markdown(reduce_risk)
-
-with tab6:
-    st.subheader("Motivazione tecnica del calcolo")
-    st.dataframe(explanations_df, use_container_width=True, hide_index=True)
-
-    st.subheader("Indicatori tecnici")
-    technical_df = pd.DataFrame([
-        {"Indicatore": "Indice di detection", "Valore": technical_data["nc_detection_ratio"], "Descrizione": "Rapporto tra NC totali e ispezioni"},
-        {"Indicatore": "Interference score", "Valore": technical_data["interference_score"], "Descrizione": "Interferenza corretta per tipo e numero attività"},
-        {"Indicatore": "Fattore criticità attività", "Valore": technical_data["activity_criticality_factor"], "Descrizione": "Peso dell'attività più critica"},
-        {"Indicatore": "Fattore numero attività", "Valore": technical_data["activity_count_factor"], "Descrizione": "Correttivo per contemporaneità"},
-        {"Indicatore": "Correttivo copertura HSE", "Valore": technical_data["hse_coverage_adjustment"], "Descrizione": technical_data["hse_coverage_status"]},
-        {"Indicatore": "Bonus Stop Work", "Valore": -technical_data["stop_work_bonus"], "Descrizione": "Solo bonus, con impatto massimo limitato a -6"},
-        {"Indicatore": "Impatto diretto fase", "Valore": technical_data["phase_direct_impact"], "Descrizione": "La fase non incide direttamente sul Risk Index"},
-        {"Indicatore": "Bonus coerenza fase/sensibilizzazioni", "Valore": -technical_data["phase_awareness_bonus"], "Descrizione": ", ".join(technical_data["phase_awareness_matches"]) if technical_data["phase_awareness_matches"] else "Nessuna corrispondenza"}
-    ])
-    st.dataframe(technical_df, use_container_width=True, hide_index=True)
-
-with tab7:
-    st.subheader("Chiedi all'HSE Advisor locale")
-    question = st.text_input(
-        "Fai una domanda sul report",
-        placeholder="Esempio: la copertura HSE è sufficiente?",
-        key="advisor_question"
-    )
-    if st.button("Chiedi all'Advisor", key="advisor_button"):
-        if question.strip():
-            st.session_state.advisor_answer = local_hse_advisor(
-                question, data, risk, level, actions_df, technical_data
-            )
+CSS = '''
+<style>
+:root{--ink:#123047;--accent:#087f8c}
+.stApp{background:#f3f6fa}
+.block-container{max-width:1450px;padding-top:2rem;padding-bottom:3rem}
+h1,h2,h3{color:#123047;letter-spacing:-.025em}
+[data-testid="stSidebar"]{background:#e9eff5;border-right:1px solid #d4dfe9}
+[data-testid="stMetric"]{background:#fff;border:1px solid #d8e3eb;padding:18px;border-radius:12px}
+[data-testid="stMetricLabel"]{color:#385268}
+[data-testid="stMetricValue"]{color:#123047}
+.stButton>button[kind="primary"]{background:#087f8c;border:0;border-radius:8px}
+[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px}
+[data-testid="stCaptionContainer"]{color:#415c70}
+@media(max-width:700px){.block-container{padding:1rem}.stApp h1{font-size:1.9rem}}
+</style>'''
+
+
+def clean_rows(frame, awareness=False):
+    rows = []
+    for raw in frame.to_dict('records'):
+        if pd.isna(raw.get('theme')):
+            # Una nuova riga vuota non è un evento; una riga compilata in parte va segnalata.
+            if all(pd.isna(v) or v in ['', False] for v in raw.values()):
+                continue
+        if awareness:
+            rows.append(dict(theme=raw.get('theme'), count=raw.get('count'),
+                             coverage=None if pd.isna(raw.get('coverage')) else float(raw['coverage'])))
         else:
-            st.session_state.advisor_answer = "Scrivi una domanda."
-    if st.session_state.advisor_answer:
-        st.markdown(st.session_state.advisor_answer)
+            rows.append(dict(theme=raw.get('theme'), severity=raw.get('severity'), status=raw.get('status'),
+                             late=False if pd.isna(raw.get('late')) else bool(raw['late']),
+                             repeat=False if pd.isna(raw.get('repeat')) else bool(raw['repeat']),
+                             note='' if pd.isna(raw.get('note')) else str(raw['note'])))
+    return rows
 
-with tab8:
-    st.subheader("HSE Scorecard")
-    st.metric("Valutazione complessiva", f"{scorecard_overall:.1f} / 10")
-    for _, row in scorecard_df.iterrows():
-        col_score, col_reason = st.columns([1, 2.3])
-        with col_score:
-            st.markdown(f"### {row['Area']}")
-            st.markdown(f"## {row['Stelle']}")
-            st.markdown(f"**{float(row['Punteggio']):.1f} / 10**")
-        with col_reason:
-            st.write(row["Motivazione"])
-            st.progress(float(row["Punteggio"]) / 10)
-        st.divider()
 
-with tab9:
-    st.subheader("Generatore Checklist HSE")
-    st.info(
-        "La checklist non viene compilata nel tool. Seleziona i capitoli e scarica il format Word da inviare all'HSE di cantiere."
-    )
+def anomaly_editor(label, rows, key):
+    st.markdown('**' + label + '**')
+    frame = pd.DataFrame(rows, columns=['theme', 'severity', 'status', 'late', 'repeat', 'note'])
+    config = {
+       'theme': st.column_config.SelectboxColumn('Tema', options=THEMES, required=True),
+       'severity': st.column_config.SelectboxColumn('Gravità', options=list(SEVERITY), required=True),
+       'status': st.column_config.SelectboxColumn('Stato a fine mese', options=list(STATUS), required=True),
+       'late': st.column_config.CheckboxColumn('Aperta scaduta', default=False),
+       'repeat': st.column_config.CheckboxColumn('Recidiva', default=False),
+       'note': st.column_config.TextColumn('Descrizione / riferimento')}
+    return clean_rows(st.data_editor(frame, num_rows='dynamic', column_config=config, hide_index=True,
+                                    width='stretch', key=key))
 
-    suggested_sections = ["Controlli generali pre-attività"]
-    suggested_sections.extend(
-        ACTIVITY_TO_CHECKLIST[activity]
-        for activity in data["activities"]
-        if activity in ACTIVITY_TO_CHECKLIST
-    )
-    suggested_sections = list(dict.fromkeys(suggested_sections))
 
-    selected_checklists = st.multiselect(
-        "Capitoli da inserire nel documento",
-        options=list(CHECKLIST_LIBRARY.keys()),
-        default=suggested_sections,
-        help="Le attività già selezionate nel calcolo vengono proposte automaticamente, ma puoi aggiungere o rimuovere capitoli."
-    )
+def render_form(records):
+    if 'draft' not in st.session_state:
+        st.session_state.draft = default_data()
+    d = st.session_state.draft
+    rev = st.session_state.get('draft_revision', 0)
+    st.title('Valutazione mensile')
+    st.caption('WIND / SOLAR / BESS · Input riferiti esclusivamente al mese selezionato')
+    st.info('Registrare ogni anomalia una sola volta: NC formale oppure criticità informale. '
+            'Per gli eventi precedenti riportare solo quelli ancora aperti a fine mese; non ricontare le chiusure dei mesi precedenti.')
+    names = sorted({x['data']['nome'] for x in records}, key=str.casefold)
+    if names:
+        with st.expander('Usa il nome di un cantiere già presente'):
+            chosen = st.selectbox('Cantieri registrati', names)
+            if st.button('Usa questo nome'):
+                st.session_state.draft = {**d, 'nome': chosen}
+                st.session_state.draft_revision = rev + 1
+                st.rerun()
+    with st.form(f'evaluation_{rev}'):
+        st.subheader('1 · Cantiere e periodo')
+        a, b, c = st.columns([2, 1, 1])
+        name = a.text_input('Nome cantiere', d['nome'], max_chars=120, help='Usare lo stesso nome ogni mese per collegare lo storico.')
+        technology = b.selectbox('Tecnologia', ['Wind', 'Solar', 'BESS'], index=['Wind', 'Solar', 'BESS'].index(d['technology']))
+        month = c.date_input('Mese di riferimento', date.fromisoformat(d['month'] + '-01'), max_value=date.today(), help='Il giorno viene ignorato: il periodo è sempre mensile.')
+        phase = st.selectbox('Fase operativa prevalente', list(PHASE_THEMES), index=list(PHASE_THEMES).index(d['fase']))
+        st.caption('Se selezioni il mese corrente, la valutazione è parziale e va confrontata con cautela.')
+        st.subheader('2 · Lavorazioni e interferenze')
+        activities = st.multiselect('Attività effettivamente svolte nel mese', list(ACTIVITY), default=d['activities'])
+        interference = st.slider('Interferenza fra attività', 1, 10, int(d['interference_level']),
+          help='1: attività separate. 3: contatti occasionali gestiti. 5: aree/risorse condivise. 7: sovrapposizioni frequenti. 10: interferenze continue senza separazione efficace.')
+        st.subheader('3 · Anomalie e follow-up')
+        st.caption('Aperte = presenti a fine mese; chiuse = risolte durante il mese. Gravità alta = potenziale danno grave, da motivare nella descrizione. '
+                   'Criticità informali: peso inferiore, nessuna soglia automatica. Se formalizzate, rimuoverle dalla tabella informale.')
+        nc = anomaly_editor('NC formali · massimo 30 punti', d['nc_items'], f'nc_{rev}')
+        crit = anomaly_editor('Criticità informali · massimo 8 punti', d['crit_items'], f'crit_{rev}')
+        danger = st.checkbox('È ancora presente un pericolo grave e attuale a fine valutazione', value=d['imminent_danger'],
+           help='Attiva un allarme dedicato e un indice minimo 81. Non dipende dal canale formale/informale di registrazione.')
+        st.subheader('4 · Organizzazione e presidio')
+        a, b, c = st.columns(3)
+        app = a.number_input('Imprese appaltatrici operative', 0, 200, int(d['app']))
+        sub = b.number_input('Imprese subappaltatrici operative', 0, 200, int(d['sub']))
+        hse = c.number_input('Professionisti HSE delle imprese', 0, 200, int(d['company_hse']), help='Dato descrittivo; non equivale a copertura reale.')
+        coverage = st.slider('Copertura HSE effettiva delle lavorazioni (%)', 0, 100, int(d['hse_coverage']),
+          help='Quota delle lavorazioni/turni/aree per cui è stato assicurato il presidio HSE pianificato. Stima dichiarata, non numero di persone e non criterio normativo universale.')
+        a, b = st.columns(2)
+        inspections = a.number_input('Ispezioni strutturate eseguite nel mese', 0, 2000, int(d['inspections']))
+        target = b.number_input('Target mensile ispezioni · politica comune di confronto', 1, 1000, int(d['inspection_target']),
+          help='Default 4 è una ipotesi gestionale. Per graduatorie omogenee usare lo stesso target; il confronto esclude target diversi.')
+        st.subheader('5 · Stop Work')
+        st.caption('Positivo: interruzione preventiva tempestiva e gestita. Negativo: stop imposto per carenza o mancato rispetto di misure. '
+                   'Classificare ciascun evento in una sola categoria; registrare una sola volta anche l’anomalia sottostante. La classificazione resta responsabilità dell’utilizzatore.')
+        a, b = st.columns(2)
+        positive = a.number_input('Stop Work positivi · massimo −2', 0, 1000, int(d['stop_positive']))
+        negative = b.number_input('Stop Work negativi · massimo +6', 0, 1000, int(d['stop_negative']))
+        st.subheader('6 · Sensibilizzazioni mirate')
+        st.caption('Una riga per tema. Copertura = % di lavoratori destinatari unici raggiunti sul tema nel mese (non somma delle presenze). '
+                   'Lasciare vuota se sconosciuta: fattore prudenziale 50%. Senza collegamento ad attività, anomalie aperte o fase non c’è bonus.')
+        awareness_frame = pd.DataFrame(d['awareness'], columns=['theme', 'count', 'coverage'])
+        awareness = clean_rows(st.data_editor(awareness_frame, num_rows='dynamic', hide_index=True, width='stretch',
+            key=f'awareness_{rev}', column_config={
+                'theme': st.column_config.SelectboxColumn('Tema', options=THEMES, required=True),
+                'count': st.column_config.NumberColumn('Incontri sul tema', min_value=1, max_value=1000, step=1, required=True),
+                'coverage': st.column_config.NumberColumn('Destinatari unici raggiunti (%)', min_value=0, max_value=100, step=1)}), awareness=True)
+        with st.expander('7 · Dati di esposizione FACOLTATIVI'):
+            st.write('Puoi lasciare tutto a zero: significa dato non disponibile. Questi dati producono un indice contestualizzato separato, '
+                     'senza modificare l’indice base usato nelle graduatorie. I rapporti adottati sono ipotesi gestionali da calibrare.')
+            a, b, c = st.columns(3)
+            hours = a.number_input('Ore lavorate complessive del mese', 0., 10000000., float(d['hours'] or 0), step=100.)
+            workers = b.number_input('Numero medio lavoratori nel mese', 0, 100000, int(d['workers'] or 0))
+            days = c.number_input('Giorni di attività nel mese', 0, 31, int(d['days'] or 0))
+        notes = st.text_area('Note della valutazione', d['notes'], max_chars=5000)
+        submitted = st.form_submit_button('Calcola la valutazione', type='primary', width='stretch')
+    if submitted:
+        candidate = dict(nome=name.strip(), technology=technology, fase=phase, month=month.strftime('%Y-%m'),
+            app=app, sub=sub, company_hse=hse, hse_coverage=coverage, inspections=inspections,
+            inspection_target=target, activities=activities, interference_level=interference,
+            nc_items=nc, crit_items=crit, awareness=awareness, stop_positive=positive, stop_negative=negative,
+            imminent_danger=danger, hours=hours or None, workers=workers or None, days=days or None, notes=notes)
+        errors = validate_data(candidate)
+        if errors:
+            for error in errors:
+                st.error(error)
+        else:
+            st.session_state.draft = candidate
+            st.session_state.current_report = new_record(candidate, calculate_risk(candidate))
+            st.success('Valutazione calcolata. Apri “Risultati e azioni” per analizzarla e salvarla nello storico.')
 
-    if selected_checklists:
-        total_questions = sum(len(CHECKLIST_LIBRARY[item]) for item in selected_checklists)
-        st.caption(f"Documento composto da {len(selected_checklists)} capitoli e {total_questions} verifiche.")
-        checklist_buffer = generate_checklist_word(data, selected_checklists)
-        st.download_button(
-            label="📥 Scarica Checklist Word",
-            data=checklist_buffer,
-            file_name=f"Checklist_HSE_{safe_filename(data['nome'])}.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True
-        )
+
+def driver_chart(r):
+    frame = pd.DataFrame(r['drivers'])
+    return alt.Chart(frame).mark_bar(cornerRadiusEnd=4).encode(
+        x=alt.X('Contributo:Q', title='Punti effettivi sull’indice base'),
+        y=alt.Y('Area:N', sort=None, title=None),
+        color=alt.condition(alt.datum.Contributo < 0, alt.value('#16826b'), alt.value('#225873')),
+        tooltip=['Area:N', alt.Tooltip('Contributo:Q', format='.2f')]).properties(height=390)
+
+
+def render_report(store, records):
+    st.title('Risultati e azioni')
+    record = st.session_state.get('current_report')
+    if not record:
+        st.info('Calcola una valutazione oppure aprine una dallo storico.')
+        return
+    d, r = record['data'], record['result']
+    st.subheader(f"{d['nome']} · {d['technology']} · {d['month']}")
+    st.caption(f"Snapshot calcolato · modello {MODEL_VERSION} · modificare il modulo non aggiorna questo report finché non ricalcoli.")
+    a, b, c, e = st.columns(4)
+    a.metric('Indice base', f"{r['score']:.1f} / 100", r['level'], delta_color='off')
+    b.metric('Indice contestualizzato', '—' if r['context_score'] is None else f"{r['context_score']:.1f} / 100")
+    c.metric('NC formali aperte', sum(x['status'] == 'Aperta' for x in d['nc_items']))
+    e.metric('Criticità informali aperte', sum(x['status'] == 'Aperta' for x in d['crit_items']))
+    st.caption('0–20 Basso · >20–40 Medio basso · >40–60 Medio · >60–80 Alto · >80–100 Critico. '
+               'Indice gestionale sperimentale: non probabilità di infortunio e non valutazione sostitutiva dei rischi di sito.')
+    if r['floor']:
+        st.error(f"Soglia minima attiva: {r['floor_reason']} → almeno {r['floor']:.0f}/100. I bonus non la possono compensare.")
+    if d['month'] == date.today().strftime('%Y-%m'):
+        st.warning('Mese corrente: dati parziali. La graduatoria consolidata include solo mesi conclusi.')
+    st.write(executive_summary(d, r))
+    saved_ids = {x['id'] for x in records}
+    if st.button('Salva questa valutazione nello storico', type='primary', disabled=record['id'] in saved_ids):
+        try:
+            store.save_many([record])
+            st.success('Valutazione salvata. Scarica il backup per conservarla anche fuori dall’app.')
+            st.rerun()
+        except Exception:
+            st.error('Salvataggio non riuscito. Il report resta disponibile in questa sessione: scarica il backup della valutazione qui sotto.')
+    st.download_button('Backup di questa valutazione', backup_bytes([record]), f"{safe_filename(d['nome'])}_{d['month']}.json", 'application/json')
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(['Diagnosi e azioni', 'Sensibilizzazioni e toolkit', 'Scenari', 'Metodo e scorecard', 'Esporta'])
+    with tab1:
+        st.altair_chart(driver_chart(r), width='stretch')
+        st.caption('La somma dei contributi, inclusi limite di scala e soglia minima, ricostruisce l’indice base.')
+        st.subheader('Action Plan proposto')
+        actions = action_plan(d, r)
+        if actions:
+            st.dataframe(pd.DataFrame(actions), hide_index=True, width='stretch')
+        else:
+            st.info('Nessuna azione specifica generata. Mantenere le misure pianificate e verificarne l’efficacia.')
+        st.caption('Responsabili e termini sono proposte da assegnare e confermare. Le cause sono ipotesi da verificare in campo, non una root cause dimostrata.')
+        for x in sorted(r['drivers'][:6], key=lambda x: x['Contributo'], reverse=True):
+            with st.expander(f"{x['Area']} · {x['Contributo']:.1f} punti"):
+                st.write(f"Indice dell’area: {x['Indice area']:.1f}/100; peso massimo: {x['Peso massimo']} punti.")
+                st.write(next((t for t in r['explanations'] if t.startswith({'NC formali':'NC formali:', 'Criticità informali':'Criticità informali:',
+                    'Attività':'Attività:', 'Interferenze':'Interferenze:', 'Organizzazione':'Organizzazione:', 'Presidio e controlli':'Presidio:'}[x['Area']])), ''))
+    with tab2:
+        st.subheader('Pertinenza delle sensibilizzazioni effettuate')
+        if r['awareness_details']:
+            frame = pd.DataFrame(r['awareness_details'])
+            frame['Bonus punti'] = [8 * item['Pertinenza'] * item['Efficacia convenzionale'] / sum(r['needs'].values()) for item in r['awareness_details']]
+            st.dataframe(frame, hide_index=True, width='stretch')
+        else:
+            st.info('Nessuna sensibilizzazione registrata nel mese.')
+        themes = sorted(THEMES, key=lambda t: r['needs'].get(t, 0), reverse=True)
+        theme = st.selectbox('Genera un toolbox a tema · temi prioritari in cima', themes)
+        st.text(toolbox_text(theme, d, r))
+        st.download_button('Scarica toolbox Word', word_report(d, r, theme), f"Toolbox_{safe_filename(theme)}_{d['month']}.docx")
+        st.subheader('Checklist HSE pre-attività')
+        defaults = list(dict.fromkeys(['Controlli generali pre-attività'] + [ACTIVITY_TO_CHECKLIST[a] for a in d['activities'] if a in ACTIVITY_TO_CHECKLIST]))
+        sections = st.multiselect('Capitoli della checklist', list(CHECKLIST_LIBRARY), default=defaults)
+        if sections:
+            st.download_button('Scarica checklist Word', generate_checklist_word(d, sections).getvalue(), f"Checklist_{safe_filename(d['nome'])}.docx")
+        st.subheader('Assistente locale a regole')
+        q = st.text_input('Domanda su indice, azioni, HSE o sensibilizzazioni', max_chars=500)
+        if st.button('Spiega il report'):
+            st.session_state.advisor_reply = (record['id'], local_advisor(q, d, r))
+        reply = st.session_state.get('advisor_reply')
+        if reply and reply[0] == record['id']:
+            st.markdown(reply[1])
+    with tab3:
+        st.subheader('Su quali campi intervenire')
+        st.dataframe(pd.DataFrame(simulations(d, r)), hide_index=True, width='stretch')
+        st.caption('Scenari indipendenti, non sommabili. Simulano il punteggio e non la riduzione reale del rischio. '
+                   'Chiusura significa attuazione e verifica delle misure; un pericolo attuale resta attivo finché non è realmente rimosso e rivalutato.')
+    with tab4:
+        st.subheader('Formula e contributi verificabili')
+        st.code('Base = clamp(Σ indice_area × peso / 100 + SW_neg − SW_pos − bonus_toolbox, 0, 100)\nFinale = max(Base, soglia_minima)')
+        st.dataframe(pd.DataFrame(r['drivers']), hide_index=True, width='stretch')
+        for text in r['explanations']:
+            st.write('• ' + text)
+        st.subheader('Scorecard dei fattori · più alto = maggiore attenzione')
+        st.caption('Questa scorecard rappresenta gli stessi indici area del modello, senza un secondo algoritmo incoerente.')
+        for row in r['drivers'][:6]:
+            st.write(f"{row['Area']}: {row['Indice area']:.1f}/100")
+            st.progress(bounded(row['Indice area']) / 100)
+        st.subheader('Dati facoltativi e qualità del dato')
+        st.write(r['context_basis'])
+        if r['context_target'] is not None:
+            st.write(f"Target contestualizzato: {r['context_target']:.2f} ispezioni. L’indice contestualizzato modifica solo il deficit ispettivo.")
+        for text in r['missing']:
+            st.warning(text)
+        if d['hours']:
+            st.write(f"NC formali rilevate / 10.000 ore: {len(d['nc_items']) / d['hours'] * 10000:.2f} (include arretrato aperto: non è un tasso di nuove NC).")
+        st.write('NC/ispezioni (descrittivo): ' + (f"{len(d['nc_items']) / d['inspections']:.2f}" if d['inspections'] else 'non valutabile'))
+    with tab5:
+        st.caption('I report riflettono lo snapshot visualizzato. Il JSON conserva tutti gli input per ripristino e ricalcolo.')
+        filename = safe_filename(d['nome']) + '_' + d['month']
+        if st.button('Prepara i report completi'):
+            with st.spinner('Preparazione report…'):
+                st.session_state.exports = dict(id=record['id'], excel=excel_report(d, r, records),
+                                                 ppt=ppt_report(d, r), word=word_report(d, r))
+        exports = st.session_state.get('exports')
+        if exports and exports['id'] == record['id']:
+            st.download_button('Excel completo', exports['excel'], filename + '.xlsx')
+            st.download_button('PowerPoint', exports['ppt'], filename + '.pptx')
+            st.download_button('Report Word', exports['word'], filename + '.docx')
+
+
+def render_history(records):
+    st.title('Storico per cantiere')
+    frame = history_frame(records)
+    if frame.empty:
+        st.info('Salva la prima valutazione per iniziare lo storico.')
+        return
+    sites = sorted(frame['Cantiere'].unique())
+    site = st.selectbox('Cantiere', sites)
+    selected = frame[frame['site'] == site_key(site)].copy()
+    selected['Periodo'] = pd.to_datetime(selected['Mese'])
+    st.caption('Ogni salvataggio è una revisione conservata. I grafici usano l’ultima revisione per cantiere, mese e versione modello. '
+               'I mesi mancanti interrompono la linea: non sono valutazioni pari a zero.')
+    target_values = {x['data']['inspection_target'] for x in records if site_key(x['data']['nome']) == site_key(site)}
+    if len(target_values) > 1:
+        st.warning('Il target ispettivo è cambiato nello storico: parte del trend può dipendere da questo cambiamento di criterio.')
+    # Reindicizzazione per non collegare mesi mancanti e dividerli in segmenti.
+    series = selected.set_index('Periodo').reindex(pd.date_range(selected['Periodo'].min(), selected['Periodo'].max(), freq='MS')).rename_axis('Periodo').reset_index()
+    series['segmento'] = series['Indice'].isna().cumsum()
+    st.altair_chart(alt.Chart(series.dropna(subset=['Indice'])).mark_line(point=True).encode(
+        x=alt.X('Periodo:T', title='Mese'), y=alt.Y('Indice:Q', scale=alt.Scale(domain=[0,100])),
+        detail='segmento:N', tooltip=['Periodo:T', 'Indice:Q', 'Livello:N']), width='stretch')
+    st.dataframe(selected.drop(columns=['site','Periodo','id']), hide_index=True, width='stretch')
+    revisions = [x for x in records if site_key(x['data']['nome']) == site_key(site)]
+    revisions.sort(key=lambda x: (x['data']['month'], x['saved_at']), reverse=True)
+    lookup = {x['id']: x for x in revisions}
+    ident = st.selectbox('Apri una valutazione o revisione', list(lookup), format_func=lambda i:
+        f"{lookup[i]['data']['month']} · {lookup[i]['result']['score']:.1f} · salvata {lookup[i]['saved_at'][:19]} · {i[:8]}")
+    a, b = st.columns(2)
+    if a.button('Apri nei risultati'):
+        st.session_state.current_report = deepcopy(lookup[ident])
+        st.success('Valutazione caricata: apri “Risultati e azioni”.')
+    if b.button('Usa come base per una nuova valutazione'):
+        st.session_state.draft = deepcopy(lookup[ident]['data'])
+        st.session_state.draft_revision = st.session_state.get('draft_revision', 0) + 1
+        st.success('Modulo preparato. Apri “Valutazione mensile” e aggiorna mese e dati prima del calcolo.')
+
+
+def render_comparison(records):
+    st.title('Confronto cantieri')
+    frame = history_frame(records)
+    if frame.empty:
+        st.info('Servono valutazioni salvate nello storico.')
+        return
+    months = sorted([m for m in frame['Mese'].unique() if m < date.today().strftime('%Y-%m')], reverse=True)
+    if not months:
+        st.info('La graduatoria consolidata richiede almeno un mese concluso.')
+        return
+    month = st.selectbox('Mese concluso · stesso periodo per tutti', months)
+    types = st.multiselect('Tecnologie', ['Wind','Solar','BESS'], default=['Wind','Solar','BESS'])
+    lookup = {x['id']: x for x in records}
+    frame['Target'] = frame['id'].map(lambda i: lookup[i]['data']['inspection_target'])
+    target = st.selectbox('Politica comune · target ispezioni', sorted(frame.loc[frame['Mese'] == month, 'Target'].unique()))
+    selected = frame[(frame['Mese'] == month) & frame['Tecnologia'].isin(types) & (frame['Target'] == target) & (frame['Versione'] == MODEL_VERSION)].sort_values('Indice', ascending=False)
+    st.caption('Indice base; stesso mese, stessa versione modello e stesso target ispezioni. '
+               'La graduatoria dipende anche da completezza e uniformità delle registrazioni; l’indice contestualizzato non viene mescolato al base.')
+    if selected.empty:
+        st.info('Nessuna valutazione con questi filtri.')
+        return
+    st.altair_chart(alt.Chart(selected).mark_bar(cornerRadiusEnd=4, color='#225873').encode(
+        x=alt.X('Indice:Q', scale=alt.Scale(domain=[0,100])), y=alt.Y('Cantiere:N', sort='-x'),
+        tooltip=['Cantiere','Tecnologia','Indice','Livello']), width='stretch')
+    st.dataframe(selected[['Cantiere','Tecnologia','Mese','Indice','Livello','Target']], hide_index=True, width='stretch')
+    counts = selected.groupby('Livello').size().reset_index(name='Cantieri')
+    st.subheader('Distribuzione dei cantieri per fascia')
+    st.altair_chart(alt.Chart(counts).mark_arc(innerRadius=65).encode(
+        theta='Cantieri:Q', color=alt.Color('Livello:N', scale=alt.Scale(domain=['Basso','Medio basso','Medio','Alto','Critico'], range=COLORS)),
+        tooltip=['Livello','Cantieri']), width='stretch')
+
+
+def render_archive(store, records):
+    st.title('Archivio e backup')
+    if store.mode == 'session':
+        st.warning('Modalità gratuita senza configurazione: dati disponibili solo nella sessione corrente. '
+                   'Scarica il backup JSON prima di chiudere o ricaricare il browser; importalo alla prossima apertura. Non è uno storico cloud automatico.')
+    elif store.mode == 'sqlite':
+        st.warning('Archivio SQLite locale: persiste su un disco stabile, ma su Streamlit Community Cloud può essere perso al riavvio o al redeploy. Scarica regolarmente il backup.')
     else:
-        st.warning("Seleziona almeno un capitolo da inserire nella checklist.")
+        st.success('Archivio PostgreSQL configurato: storico condiviso fra gli utenti autorizzati dell’app. La conservazione dipende dal servizio database configurato.')
+    st.metric('Valutazioni e revisioni archiviate', len(records))
+    st.download_button('Scarica backup completo JSON', backup_bytes(records), f"HSE_backup_{date.today().isoformat()}.json", 'application/json')
+    uploaded = st.file_uploader('Ripristina o unisci un backup JSON · massimo 20 MB', type=['json'])
+    if uploaded is not None and st.button('Verifica e importa il backup'):
+        try:
+            incoming = parse_backup(uploaded.getvalue())
+            existing = {x['id']: x for x in records}
+            for item in incoming:
+                if item['id'] in existing and (item['data'] != existing[item['id']]['data'] or item['saved_at'] != existing[item['id']]['saved_at']):
+                    raise ValueError('Conflitto: un identificativo esistente ha dati differenti. Nessun record importato.')
+            store.save_many(incoming)
+            st.success(f"Importazione completata: {sum(x['id'] not in existing for x in incoming)} nuove valutazioni. I duplicati identici sono ignorati.")
+            st.rerun()
+        except (ValueError, TypeError, KeyError, OverflowError):
+            st.error('Backup non valido o in conflitto. Nessun dato importato: controllare formato, versione modello e campi obbligatori.')
+        except Exception:
+            st.error('Archivio non raggiungibile: importazione non completata. Riprova quando il collegamento è disponibile.')
+    with st.expander('Come scegliere la conservazione dei dati'):
+        st.write('Nessun servizio a pagamento è necessario per usare il tool e i backup portabili. '
+                 'Uno storico automatico condiviso su Streamlit Cloud richiede un database esterno: il codice supporta PostgreSQL. '
+                 'Un eventuale piano gratuito va scelto e configurato separatamente, verificando limiti e condizioni del fornitore. '
+                 'SQLite è adatto a un PC/server con disco persistente. Le istruzioni sono nel README del pacchetto.')
+        st.write('L’archivio configurato è condiviso da chi conosce la password dell’app; non ci sono account personali o separazione per impresa. '
+                 'Usare dati di cantiere essenziali, senza informazioni personali non necessarie.')
 
-with tab10:
-    st.subheader("Download report")
-    st.caption("La sezione Export contiene gli output complessivi del Risk Tool. La checklist Word rimane disponibile nell'HSE Toolkit.")
 
-    ppt = generate_ppt(
-        data,
-        risk,
-        level,
-        driver_df,
-        action_plan_df,
-        summary,
-        root_cause,
-        toolbox,
-        technical_data,
-        scorecard_df,
-        scorecard_overall
-    )
-    ppt_buffer = BytesIO()
-    ppt.save(ppt_buffer)
-    ppt_buffer.seek(0)
+def main():
+    st.set_page_config(page_title='HSE Risk Platform', page_icon='🦺', layout='wide')
+    st.markdown(CSS, unsafe_allow_html=True)
+    mode = str(setting('storage_mode', 'session')).lower()
+    password = str(setting('app_password', ''))
+    if mode not in ['session', 'sqlite', 'postgres']:
+        st.error('Configurazione archivio non valida.')
+        st.stop()
+    if mode != 'session' and not password:
+        st.error('Per usare un archivio condiviso configura app_password nei Secrets. In alternativa usa storage_mode="session".')
+        st.stop()
+    if password:
+        if not st.session_state.get('authenticated'):
+            st.title('HSE Risk Platform')
+            with st.form('access'):
+                entered = st.text_input('Password di accesso', type='password')
+                go = st.form_submit_button('Accedi')
+            if go:
+                if hmac.compare_digest(entered.encode(), password.encode()):
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.error('Password non corretta.')
+            st.stop()
+    try:
+        store = HistoryStore(mode, str(setting('database_url')), str(setting('sqlite_path', 'hse_history.sqlite3')))
+        records = store.all()
+    except Exception:
+        st.error('Archivio non disponibile. Controllare configurazione e collegamento. Nessun passaggio automatico a un archivio vuoto.')
+        st.stop()
+    with st.sidebar:
+        st.markdown('## HSE Risk Platform')
+        st.caption('WIND · SOLAR · BESS')
+        page = st.radio('Navigazione', ['Valutazione mensile', 'Risultati e azioni', 'Storico cantiere', 'Confronto cantieri', 'Archivio e backup'])
+        st.divider()
+        st.caption(f'Modello {MODEL_VERSION} · pesi sperimentali')
+        st.caption('Periodo: un mese. Nessuna API AI. Output generati da regole esplicite.')
+        st.caption('Archivio: ' + {'session':'sessione + backup portabile','sqlite':'SQLite locale','postgres':'PostgreSQL condiviso'}[mode])
+        if password and st.button('Esci'):
+            st.session_state.clear()
+            st.rerun()
+    if page == 'Valutazione mensile':
+        render_form(records)
+    elif page == 'Risultati e azioni':
+        render_report(store, records)
+    elif page == 'Storico cantiere':
+        render_history(records)
+    elif page == 'Confronto cantieri':
+        render_comparison(records)
+    else:
+        render_archive(store, records)
 
-    excel_buffer = generate_excel(
-        data,
-        risk,
-        level,
-        driver_df,
-        actions_df,
-        action_plan_df,
-        explanations_df,
-        summary,
-        root_cause,
-        toolbox,
-        reduce_risk,
-        technical_data,
-        scorecard_df,
-        scorecard_overall
-    )
 
-    filename = safe_filename(data["nome"])
-    col_a, col_b = st.columns(2)
+if __name__ == '__main__':
+    main()
 
-    with col_a:
-        st.download_button(
-            label="📥 Scarica PowerPoint",
-            data=ppt_buffer,
-            file_name=f"HSE_Risk_Report_{filename}.pptx",
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            use_container_width=True
-        )
-
-    with col_b:
-        st.download_button(
-            label="📥 Scarica Excel",
-            data=excel_buffer,
-            file_name=f"HSE_Risk_Report_{filename}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )

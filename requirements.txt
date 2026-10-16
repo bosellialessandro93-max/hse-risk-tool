@@ -1,5 +1,6 @@
-pandas>=2.2,<3
-altair>=5,<6
+streamlit==1.66.0
+pandas==3.0.6
+altair==6.3.0
 python-pptx>=1.0,<2
 python-docx>=1.1,<2
 openpyxl>=3.1,<4
@@ -8,3 +9,4 @@ reportlab>=4.2,<5
 Pillow>=10,<13
 pytesseract>=0.3.13,<0.4
 pdfplumber>=0.11,<0.12
+pyarrow==24.0.0

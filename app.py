@@ -29,6 +29,7 @@ from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.shared import Pt, Inches as DocxInches
 
 MODEL_VERSION = '2.0.0'
+UI_VERSION = '2.0.2'
 SCHEMA_VERSION = 2
 WEIGHTS = {'NC formali': 30, 'Criticità informali': 8, 'Attività': 22,
            'Interferenze': 15, 'Organizzazione': 10, 'Presidio e controlli': 15}
@@ -390,10 +391,13 @@ def action_plan(d, r):
 
 def executive_summary(d, r):
     top = sorted(r['drivers'][:6], key=lambda x: x['Contributo'], reverse=True)[:3]
+    nc_counts, crit_counts = anomaly_counts(d['nc_items']), anomaly_counts(d['crit_items'])
     text = (f"{d['nome']} — {d['technology']}, {d['month']}: indice base {r['score']:.1f}/100 ({r['level']}). "
             'I contributi principali sono ' + ', '.join(f"{x['Area']} ({x['Contributo']:.1f} punti)" for x in top) + '. ')
     if r['floor']:
         text += f"È attiva la soglia minima {r['floor']:.0f}: {r['floor_reason']}. "
+    text += (f"NC formali: {nc_counts['total']} totali, {nc_counts['open']} aperte, {nc_counts['closed']} chiuse. "
+             f"Criticità informali: {crit_counts['total']} totali, {crit_counts['open']} aperte, {crit_counts['closed']} chiuse. ")
     text += f"Le sensibilizzazioni pertinenti riducono l’indice di {r['awareness_bonus']:.1f} punti. "
     if r['missing']:
         text += 'Qualità del dato: ' + ' '.join(r['missing'])
@@ -546,6 +550,12 @@ def word_report(d, r, theme=None):
             doc.add_paragraph(line)
     else:
         doc.add_paragraph(executive_summary(d, r))
+        for field, title in [('nc_items', 'NC formali'), ('crit_items', 'Criticità informali')]:
+            doc.add_heading(title, 1)
+            counts = anomaly_counts(d[field])
+            doc.add_paragraph(f"Totale {counts['total']} | Aperte {counts['open']} | Chiuse {counts['closed']}")
+            for event in d[field]:
+                doc.add_paragraph(f"{event['theme']} | {event['severity']} | {event['status']} | {event.get('note', '')}")
         doc.add_heading('Motivazioni e metodo', 1)
         for line in r['explanations']:
             doc.add_paragraph(line)
@@ -562,7 +572,7 @@ def excel_report(d, r, records):
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
         data_tables = {
           'Sintesi': pd.DataFrame([{'Cantiere': d['nome'], 'Tecnologia': d['technology'], 'Mese': d['month'],
-             'Indice base': r['score'], 'Livello': r['level'], 'Indice contestualizzato': r['context_score'], 'Versione modello': MODEL_VERSION}]),
+             'Indice base': r['score'], 'Livello': r['level'], 'Indice contestualizzato': r['context_score'], 'Versione modello': MODEL_VERSION, 'NC totali': len(d['nc_items']), 'NC aperte': anomaly_counts(d['nc_items'])['open'], 'NC chiuse': anomaly_counts(d['nc_items'])['closed']}]),
           'Contributi': pd.DataFrame(r['drivers']), 'Action Plan': pd.DataFrame(action_plan(d, r)),
           'NC formali': pd.DataFrame(d['nc_items']), 'Criticità informali': pd.DataFrame(d['crit_items']),
           'Sensibilizzazioni': pd.DataFrame(r['awareness_details']),
@@ -608,6 +618,10 @@ def ppt_report(d, r):
     for theme in sorted(r['needs'], key=r['needs'].get, reverse=True)[:3]:
         title, points, question = TOOLBOX_CONTENT[theme]
         pages.append(('Toolbox | ' + theme, title + '\n\n' + '\n'.join(points) + '\n\n' + question))
+    for field, title in [('nc_items', 'Registro NC formali'), ('crit_items', 'Registro criticità informali')]:
+        counts = anomaly_counts(d[field])
+        body = f"Totale {counts['total']} · Aperte {counts['open']} · Chiuse {counts['closed']}\n" + '\n'.join(f"{e['theme']} | {e['severity']} | {e['status']}: {e.get('note', '')}" for e in d[field])
+        pages.append((title, body))
     paginated = []
     for title, body in pages:
         lines = []
@@ -847,9 +861,9 @@ def generate_checklist_word(data, selected_sections):
             cells = table.add_row().cells
             cells[0].text = str(number)
             cells[1].text = question
-            cells[2].text = "☐"
-            cells[3].text = "☐"
-            cells[4].text = "☐"
+            cells[2].text = "\u2610"
+            cells[3].text = "\u2610"
+            cells[4].text = "\u2610"
             cells[5].text = ""
             for cell in cells:
                 cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
@@ -938,7 +952,7 @@ def render_form(records):
         st.session_state.draft = default_data()
     d = st.session_state.draft
     rev = st.session_state.get('draft_revision', 0)
-    st.title('Valutazione mensile')
+    st.title('\U0001f4dd Valutazione mensile')
     st.caption('WIND / SOLAR / BESS · Input riferiti esclusivamente al mese selezionato')
     st.info('Registrare ogni anomalia una sola volta: NC formale oppure criticità informale. '
             'Per gli eventi precedenti riportare solo quelli ancora aperti a fine mese; non ricontare le chiusure dei mesi precedenti.')
@@ -951,25 +965,25 @@ def render_form(records):
                 st.session_state.draft_revision = rev + 1
                 st.rerun()
     with st.form(f'evaluation_{rev}'):
-        st.subheader('1 · Cantiere e periodo')
+        st.subheader('\U0001f4cd 1 · Cantiere e periodo')
         a, b, c = st.columns([2, 1, 1])
         name = a.text_input('Nome cantiere', d['nome'], max_chars=120, help='Usare lo stesso nome ogni mese per collegare lo storico.')
         technology = b.selectbox('Tecnologia', ['Wind', 'Solar', 'BESS'], index=['Wind', 'Solar', 'BESS'].index(d['technology']))
         month = c.date_input('Mese di riferimento', date.fromisoformat(d['month'] + '-01'), max_value=date.today(), help='Il giorno viene ignorato: il periodo è sempre mensile.')
         phase = st.selectbox('Fase operativa prevalente', list(PHASE_THEMES), index=list(PHASE_THEMES).index(d['fase']))
         st.caption('Se selezioni il mese corrente, la valutazione è parziale e va confrontata con cautela.')
-        st.subheader('2 · Lavorazioni e interferenze')
+        st.subheader('\U0001f3d7\ufe0f 2 · Lavorazioni e interferenze')
         activities = st.multiselect('Attività effettivamente svolte nel mese', list(ACTIVITY), default=d['activities'])
         interference = st.slider('Interferenza fra attività', 1, 10, int(d['interference_level']),
           help='1: attività separate. 3: contatti occasionali gestiti. 5: aree/risorse condivise. 7: sovrapposizioni frequenti. 10: interferenze continue senza separazione efficace.')
-        st.subheader('3 · Anomalie e follow-up')
-        st.caption('Aperte = presenti a fine mese; chiuse = risolte durante il mese. Gravità alta = potenziale danno grave, da motivare nella descrizione. '
+        st.subheader('\U0001f50d 3 · Anomalie e follow-up')
+        st.caption('Dopo aver modificato una cella, premi Invio o clicca fuori dalla cella prima di calcolare. Aperte = presenti a fine mese; chiuse = risolte durante il mese. Gravità alta = potenziale danno grave, da motivare nella descrizione. '
                    'Criticità informali: peso inferiore, nessuna soglia automatica. Se formalizzate, rimuoverle dalla tabella informale.')
-        nc = anomaly_editor('NC formali · massimo 30 punti', d['nc_items'], f'nc_{rev}')
-        crit = anomaly_editor('Criticità informali · massimo 8 punti', d['crit_items'], f'crit_{rev}')
+        nc = anomaly_editor('\U0001f4dd NC formali · massimo 30 punti', d['nc_items'], f'nc_{rev}')
+        crit = anomaly_editor('\U0001f4cc Criticità informali · massimo 8 punti', d['crit_items'], f'crit_{rev}')
         danger = st.checkbox('È ancora presente un pericolo grave e attuale a fine valutazione', value=d['imminent_danger'],
            help='Attiva un allarme dedicato e un indice minimo 81. Non dipende dal canale formale/informale di registrazione.')
-        st.subheader('4 · Organizzazione e presidio')
+        st.subheader('\U0001f477 4 · Organizzazione e presidio')
         a, b, c = st.columns(3)
         app = a.number_input('Imprese appaltatrici operative', 0, 200, int(d['app']))
         sub = b.number_input('Imprese subappaltatrici operative', 0, 200, int(d['sub']))
@@ -980,13 +994,13 @@ def render_form(records):
         inspections = a.number_input('Ispezioni strutturate eseguite nel mese', 0, 2000, int(d['inspections']))
         target = b.number_input('Target mensile ispezioni · politica comune di confronto', 1, 1000, int(d['inspection_target']),
           help='Default 4 è una ipotesi gestionale. Per graduatorie omogenee usare lo stesso target; il confronto esclude target diversi.')
-        st.subheader('5 · Stop Work')
+        st.subheader('\u26d4 5 · Stop Work')
         st.caption('Positivo: interruzione preventiva tempestiva e gestita. Negativo: stop imposto per carenza o mancato rispetto di misure. '
                    'Classificare ciascun evento in una sola categoria; registrare una sola volta anche l’anomalia sottostante. La classificazione resta responsabilità dell’utilizzatore.')
         a, b = st.columns(2)
         positive = a.number_input('Stop Work positivi · massimo −2', 0, 1000, int(d['stop_positive']))
         negative = b.number_input('Stop Work negativi · massimo +6', 0, 1000, int(d['stop_negative']))
-        st.subheader('6 · Sensibilizzazioni mirate')
+        st.subheader('\U0001f9e0 6 · Sensibilizzazioni mirate')
         st.caption('Una riga per tema. Copertura = % di lavoratori destinatari unici raggiunti sul tema nel mese (non somma delle presenze). '
                    'Lasciare vuota se sconosciuta: fattore prudenziale 50%. Senza collegamento ad attività, anomalie aperte o fase non c’è bonus.')
         awareness_frame = pd.DataFrame(d['awareness'], columns=['theme', 'count', 'coverage'])
@@ -995,7 +1009,7 @@ def render_form(records):
                 'theme': st.column_config.SelectboxColumn('Tema', options=THEMES, required=True),
                 'count': st.column_config.NumberColumn('Incontri sul tema', min_value=1, max_value=1000, step=1, required=True),
                 'coverage': st.column_config.NumberColumn('Destinatari unici raggiunti (%)', min_value=0, max_value=100, step=1)}), awareness=True)
-        with st.expander('7 · Dati di esposizione FACOLTATIVI'):
+        with st.expander('\U0001f4d0 7 · Dati di esposizione FACOLTATIVI'):
             st.write('Puoi lasciare tutto a zero: significa dato non disponibile. Questi dati producono un indice contestualizzato separato, '
                      'senza modificare l’indice base usato nelle graduatorie. I rapporti adottati sono ipotesi gestionali da calibrare.')
             a, b, c = st.columns(3)
@@ -1003,7 +1017,7 @@ def render_form(records):
             workers = b.number_input('Numero medio lavoratori nel mese', 0, 100000, int(d['workers'] or 0))
             days = c.number_input('Giorni di attività nel mese', 0, 31, int(d['days'] or 0))
         notes = st.text_area('Note della valutazione', d['notes'], max_chars=5000)
-        submitted = st.form_submit_button('Calcola la valutazione', type='primary', width='stretch')
+        submitted = st.form_submit_button('Calcola la valutazione', icon='\U0001f9ee', type='primary', width='stretch')
     if submitted:
         candidate = dict(nome=name.strip(), technology=technology, fase=phase, month=month.strftime('%Y-%m'),
             app=app, sub=sub, company_hse=hse, hse_coverage=coverage, inspections=inspections,
@@ -1016,8 +1030,11 @@ def render_form(records):
                 st.error(error)
         else:
             st.session_state.draft = candidate
+            st.session_state.pop('trial_discarded', None)
+            st.session_state.pop('exports', None)
+            st.session_state.pop('advisor_reply', None)
             st.session_state.current_report = new_record(candidate, calculate_risk(candidate))
-            st.success('Valutazione calcolata. Apri “Risultati e azioni” per analizzarla e salvarla nello storico.')
+            st.success('Prova calcolata, non salvata. Apri “Risultati e azioni”; al termine scegli Salva e inserisci oppure Non salvare.')
 
 
 def driver_chart(r):
@@ -1029,54 +1046,114 @@ def driver_chart(r):
         tooltip=['Area:N', alt.Tooltip('Contributo:Q', format='.2f')]).properties(height=390)
 
 
+def anomaly_counts(rows):
+    opened = sum(x['status'] == 'Aperta' for x in rows)
+    return {'total': len(rows), 'open': opened, 'closed': len(rows) - opened}
+
+
+def anomaly_ledger(rows):
+    return [dict(Numero=i + 1, Tema=x['theme'], Gravità=x['severity'], Stato=x['status'],
+                 Scaduta=x['late'], Recidiva=x['repeat'], Descrizione=x.get('note', ''),
+                 **{'Fattore stato': STATUS[x['status']], 'Carico grezzo': round(anomaly_load([x]), 4)})
+            for i, x in enumerate(rows)]
+
+
+REPORT_SECTIONS = ['\U0001f4ca Sintesi del mese', '\U0001f3af Azioni e alert', '\U0001f4cb Action Plan',
+                   '\U0001f5c2\ufe0f Registro NC e criticità', '\U0001f50d Cause e motivazioni', '\U0001f9f0 Toolbox Talk',
+                   '\U0001f4c9 Come ridurre il rischio', '\U0001f9ee Dettaglio del calcolo', '\U0001f4ac HSE Advisor',
+                   '\u2b50 HSE Scorecard', '\U0001f4d1 HSE Toolkit', '\U0001f4e4 Export']
+
+
 def render_report(store, records):
-    st.title('Risultati e azioni')
+    st.title('\U0001f4ca Risultati e azioni')
     record = st.session_state.get('current_report')
     if not record:
+        if st.session_state.pop('trial_discarded', False):
+            st.success('Prova scartata: dati e output rimossi dalla sessione, senza inserimenti nello storico. Puoi iniziare una nuova valutazione.')
         st.info('Calcola una valutazione oppure aprine una dallo storico.')
         return
     d, r = record['data'], record['result']
     st.subheader(f"{d['nome']} · {d['technology']} · {d['month']}")
-    st.caption(f"Snapshot calcolato · modello {MODEL_VERSION} · modificare il modulo non aggiorna questo report finché non ricalcoli.")
-    a, b, c, e = st.columns(4)
-    a.metric('Indice base', f"{r['score']:.1f} / 100", r['level'], delta_color='off')
-    b.metric('Indice contestualizzato', '—' if r['context_score'] is None else f"{r['context_score']:.1f} / 100")
-    c.metric('NC formali aperte', sum(x['status'] == 'Aperta' for x in d['nc_items']))
-    e.metric('Criticità informali aperte', sum(x['status'] == 'Aperta' for x in d['crit_items']))
-    st.caption('0–20 Basso · >20–40 Medio basso · >40–60 Medio · >60–80 Alto · >80–100 Critico. '
-               'Indice gestionale sperimentale: non probabilità di infortunio e non valutazione sostitutiva dei rischi di sito.')
+    st.caption(f"Interfaccia {UI_VERSION} · modello {MODEL_VERSION} · snapshot calcolato: dopo modifiche al modulo premi nuovamente Calcola.")
+    a, b = st.columns(2)
+    a.metric('\U0001f4c8 Indice base', f"{r['score']:.1f} / 100", r['level'], delta_color='off')
+    b.metric('\U0001f50e Indice contestualizzato', '—' if r['context_score'] is None else f"{r['context_score']:.1f} / 100")
+    nc, crit = anomaly_counts(d['nc_items']), anomaly_counts(d['crit_items'])
+    a, b, c = st.columns(3)
+    a.metric('\U0001f4dd NC formali totali', nc['total'])
+    b.metric('\U0001f534 NC formali aperte', nc['open'])
+    c.metric('\u2705 NC formali chiuse', nc['closed'])
+    a, b, c = st.columns(3)
+    a.metric('\U0001f4cc Criticità informali totali', crit['total'])
+    b.metric('\U0001f7e0 Criticità informali aperte', crit['open'])
+    c.metric('\u2611\ufe0f Criticità informali chiuse', crit['closed'])
+    if nc['closed']:
+        st.info(f"Sono registrate {nc['total']} NC formali: {nc['open']} aperte e {nc['closed']} chiuse. "
+                'Le NC chiuse compaiono nel totale e nel registro; mantengono un peso ridotto nel calcolo e non generano nuove azioni di chiusura.')
+    st.caption('\U0001f7e2 0–20 Basso · >20–40 Medio basso · >40–60 Medio · >60–80 Alto · >80–100 Critico. '
+               'Indice gestionale sperimentale, non probabilità di infortunio.')
     if r['floor']:
-        st.error(f"Soglia minima attiva: {r['floor_reason']} → almeno {r['floor']:.0f}/100. I bonus non la possono compensare.")
+        st.error(f"\U0001f6a8 Soglia minima attiva: {r['floor_reason']} → almeno {r['floor']:.0f}/100. I bonus non la possono compensare.")
     if d['month'] == date.today().strftime('%Y-%m'):
-        st.warning('Mese corrente: dati parziali. La graduatoria consolidata include solo mesi conclusi.')
-    st.write(executive_summary(d, r))
-    saved_ids = {x['id'] for x in records}
-    if st.button('Salva questa valutazione nello storico', type='primary', disabled=record['id'] in saved_ids):
-        try:
-            store.save_many([record])
-            st.success('Valutazione salvata. Scarica il backup per conservarla anche fuori dall’app.')
-            st.rerun()
-        except Exception:
-            st.error('Salvataggio non riuscito. Il report resta disponibile in questa sessione: scarica il backup della valutazione qui sotto.')
-    st.download_button('Backup di questa valutazione', backup_bytes([record]), f"{safe_filename(d['nome'])}_{d['month']}.json", 'application/json')
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(['Diagnosi e azioni', 'Sensibilizzazioni e toolkit', 'Scenari', 'Metodo e scorecard', 'Esporta'])
-    with tab1:
+        st.warning('\U0001f4c5 Mese corrente: dati parziali, esclusi dalla graduatoria consolidata.')
+    is_saved = record['id'] in {x['id'] for x in records}
+    if is_saved:
+        st.success('\U0001f4be Valutazione già inserita nello storico.')
+    else:
+        st.info('\U0001f9ea MODALITÀ PROVA · input e output temporanei. In fondo alla pagina scegli Salva e inserisci oppure Non salvare.')
+    st.divider()
+    section = st.selectbox('\U0001f9ed Apri una sezione del report', REPORT_SECTIONS, key='report_section')
+    st.subheader(section)
+    st.caption('12 sezioni dedicate: sintesi, alert, piano azioni, registro, motivazioni, toolbox, scenari, calcolo, advisor, scorecard, checklist ed export.')
+    actions = action_plan(d, r)
+    if section == REPORT_SECTIONS[0]:
+        st.write(executive_summary(d, r))
         st.altair_chart(driver_chart(r), width='stretch')
-        st.caption('La somma dei contributi, inclusi limite di scala e soglia minima, ricostruisce l’indice base.')
-        st.subheader('Action Plan proposto')
-        actions = action_plan(d, r)
+        st.caption('Contributi effettivi, incluse le rettifiche per limite di scala e soglia minima.')
+        nc_driver = next(x for x in r['drivers'] if x['Area'] == 'NC formali')
+        crit_driver = next(x for x in r['drivers'] if x['Area'] == 'Criticità informali')
+        st.write(f"\U0001f4dd NC formali: {nc['total']} registrate, contributo {nc_driver['Contributo']:.2f} punti su 30. "
+                 f"\U0001f4cc Criticità informali: {crit['total']} registrate, contributo {crit_driver['Contributo']:.2f} punti su 8.")
+    elif section == REPORT_SECTIONS[1]:
+        if actions:
+            for item in actions:
+                text = f"{item['Priorità']} · {item['Area']} — {item['Azione']}"
+                (st.warning if item['Priorità'] == 'P1' else st.info)(text)
+        else:
+            st.success('\u2705 Nessun alert specifico generato. Mantenere e verificare le misure previste.')
+        st.caption('Azioni correttive sulle anomalie aperte. Le chiuse restano nel registro e nel calcolo con peso residuo.')
+    elif section == REPORT_SECTIONS[2]:
         if actions:
             st.dataframe(pd.DataFrame(actions), hide_index=True, width='stretch')
         else:
-            st.info('Nessuna azione specifica generata. Mantenere le misure pianificate e verificarne l’efficacia.')
-        st.caption('Responsabili e termini sono proposte da assegnare e confermare. Le cause sono ipotesi da verificare in campo, non una root cause dimostrata.')
-        for x in sorted(r['drivers'][:6], key=lambda x: x['Contributo'], reverse=True):
-            with st.expander(f"{x['Area']} · {x['Contributo']:.1f} punti"):
-                st.write(f"Indice dell’area: {x['Indice area']:.1f}/100; peso massimo: {x['Peso massimo']} punti.")
-                st.write(next((t for t in r['explanations'] if t.startswith({'NC formali':'NC formali:', 'Criticità informali':'Criticità informali:',
-                    'Attività':'Attività:', 'Interferenze':'Interferenze:', 'Organizzazione':'Organizzazione:', 'Presidio e controlli':'Presidio:'}[x['Area']])), ''))
-    with tab2:
-        st.subheader('Pertinenza delle sensibilizzazioni effettuate')
+            st.info('Nessuna azione specifica proposta.')
+        st.caption('Responsabili e scadenze proposti sono da confermare. Il piano esportabile non è un registro persistente delle chiusure.')
+    elif section == REPORT_SECTIONS[3]:
+        for field, title in [('nc_items', '\U0001f4dd Registro completo delle NC formali'), ('crit_items', '\U0001f4cc Registro completo delle criticità informali')]:
+            st.markdown('### ' + title)
+            if d[field]:
+                st.dataframe(pd.DataFrame(anomaly_ledger(d[field])), hide_index=True, width='stretch')
+                counts = anomaly_counts(d[field])
+                st.caption(f"Totale {counts['total']} · aperte {counts['open']} · chiuse {counts['closed']}. Nessun filtro di stato applicato.")
+                for item in anomaly_ledger(d[field]):
+                    with st.expander(f"{item['Numero']} · {item['Tema']} · {item['Stato']}"):
+                        st.write(item['Descrizione'] or 'Nessuna descrizione inserita.')
+                        st.write(f"Carico grezzo {item['Carico grezzo']:.4f}; fattore stato {item['Fattore stato']:.1f}.")
+            else:
+                st.info('Nessuna anomalia registrata in questo elenco.')
+        st.caption('Chiusa nei tempi: fattore 0,2; chiusa in ritardo: 0,4; aperta: 1. '
+                   'Il carico grezzo entra nella funzione non lineare: non equivale a punti finali sommabili per riga.')
+    elif section == REPORT_SECTIONS[4]:
+        st.write(executive_summary(d, r))
+        for item in sorted(r['drivers'][:6], key=lambda x: x['Contributo'], reverse=True):
+            st.markdown(f"#### {item['Area']} · {item['Contributo']:.2f} punti")
+            st.write(f"Indice area {item['Indice area']:.2f}/100 · peso massimo {item['Peso massimo']} punti.")
+            if item['Area'] in ['NC formali', 'Criticità informali']:
+                field = 'nc_items' if item['Area'] == 'NC formali' else 'crit_items'
+                for event in d[field]:
+                    st.write(f"• {event['theme']} / {event['severity']} / {event['status']}: {event.get('note', '')}")
+        st.caption('Le motivazioni spiegano i dati e il punteggio. Le cause profonde richiedono verifica sul campo: il tool non le dimostra automaticamente.')
+    elif section == REPORT_SECTIONS[5]:
         if r['awareness_details']:
             frame = pd.DataFrame(r['awareness_details'])
             frame['Bonus punti'] = [8 * item['Pertinenza'] * item['Efficacia convenzionale'] / sum(r['needs'].values()) for item in r['awareness_details']]
@@ -1084,62 +1161,87 @@ def render_report(store, records):
         else:
             st.info('Nessuna sensibilizzazione registrata nel mese.')
         themes = sorted(THEMES, key=lambda t: r['needs'].get(t, 0), reverse=True)
-        theme = st.selectbox('Genera un toolbox a tema · temi prioritari in cima', themes)
+        theme = st.selectbox('\U0001f9f0 Genera un toolbox a tema · priorità in cima', themes)
         st.text(toolbox_text(theme, d, r))
-        st.download_button('Scarica toolbox Word', word_report(d, r, theme), f"Toolbox_{safe_filename(theme)}_{d['month']}.docx")
-        st.subheader('Checklist HSE pre-attività')
-        defaults = list(dict.fromkeys(['Controlli generali pre-attività'] + [ACTIVITY_TO_CHECKLIST[a] for a in d['activities'] if a in ACTIVITY_TO_CHECKLIST]))
-        sections = st.multiselect('Capitoli della checklist', list(CHECKLIST_LIBRARY), default=defaults)
-        if sections:
-            st.download_button('Scarica checklist Word', generate_checklist_word(d, sections).getvalue(), f"Checklist_{safe_filename(d['nome'])}.docx")
-        st.subheader('Assistente locale a regole')
-        q = st.text_input('Domanda su indice, azioni, HSE o sensibilizzazioni', max_chars=500)
-        if st.button('Spiega il report'):
-            st.session_state.advisor_reply = (record['id'], local_advisor(q, d, r))
-        reply = st.session_state.get('advisor_reply')
-        if reply and reply[0] == record['id']:
-            st.markdown(reply[1])
-    with tab3:
-        st.subheader('Su quali campi intervenire')
+        st.download_button('\U0001f4e5 Scarica toolbox Word', word_report(d, r, theme), f"Toolbox_{safe_filename(theme)}_{d['month']}.docx")
+    elif section == REPORT_SECTIONS[6]:
         st.dataframe(pd.DataFrame(simulations(d, r)), hide_index=True, width='stretch')
-        st.caption('Scenari indipendenti, non sommabili. Simulano il punteggio e non la riduzione reale del rischio. '
-                   'Chiusura significa attuazione e verifica delle misure; un pericolo attuale resta attivo finché non è realmente rimosso e rivalutato.')
-    with tab4:
-        st.subheader('Formula e contributi verificabili')
+        st.caption('Scenari indipendenti e non sommabili: simulano il punteggio, non la riduzione reale del rischio. '
+                   'Chiusura significa misure attuate e verificate; il pericolo attuale resta attivo finché non viene rimosso e rivalutato.')
+    elif section == REPORT_SECTIONS[7]:
         st.code('Base = clamp(Σ indice_area × peso / 100 + SW_neg − SW_pos − bonus_toolbox, 0, 100)\nFinale = max(Base, soglia_minima)')
         st.dataframe(pd.DataFrame(r['drivers']), hide_index=True, width='stretch')
         for text in r['explanations']:
             st.write('• ' + text)
-        st.subheader('Scorecard dei fattori · più alto = maggiore attenzione')
-        st.caption('Questa scorecard rappresenta gli stessi indici area del modello, senza un secondo algoritmo incoerente.')
-        for row in r['drivers'][:6]:
-            st.write(f"{row['Area']}: {row['Indice area']:.1f}/100")
-            st.progress(bounded(row['Indice area']) / 100)
-        st.subheader('Dati facoltativi e qualità del dato')
+        st.markdown('### \U0001f50e Dati facoltativi e qualità del dato')
         st.write(r['context_basis'])
         if r['context_target'] is not None:
-            st.write(f"Target contestualizzato: {r['context_target']:.2f} ispezioni. L’indice contestualizzato modifica solo il deficit ispettivo.")
+            st.write(f"Target contestualizzato: {r['context_target']:.2f} ispezioni; cambia solo il deficit ispettivo nell’indice separato.")
         for text in r['missing']:
             st.warning(text)
-        if d['hours']:
-            st.write(f"NC formali rilevate / 10.000 ore: {len(d['nc_items']) / d['hours'] * 10000:.2f} (include arretrato aperto: non è un tasso di nuove NC).")
         st.write('NC/ispezioni (descrittivo): ' + (f"{len(d['nc_items']) / d['inspections']:.2f}" if d['inspections'] else 'non valutabile'))
-    with tab5:
-        st.caption('I report riflettono lo snapshot visualizzato. Il JSON conserva tutti gli input per ripristino e ricalcolo.')
+        if d['hours']:
+            st.write(f"NC formali / 10.000 ore: {len(d['nc_items']) / d['hours'] * 10000:.2f}; include arretrato aperto, non è un tasso di nuove NC.")
+    elif section == REPORT_SECTIONS[8]:
+        st.caption('Assistente locale a regole, senza API AI. Spiega indice, azioni, presidio e temi dei toolbox.')
+        q = st.text_input('\U0001f4ac Domanda sul report', max_chars=500)
+        if st.button('\U0001f4ac Spiega il report'):
+            st.session_state.advisor_reply = (record['id'], local_advisor(q, d, r))
+        reply = st.session_state.get('advisor_reply')
+        if reply and reply[0] == record['id']:
+            st.markdown(reply[1])
+    elif section == REPORT_SECTIONS[9]:
+        st.caption('Indici area 0–100: più alto significa maggiore attenzione. La scorecard usa gli stessi fattori della formula.')
+        for row in r['drivers'][:6]:
+            st.write(f"{row['Area']}: {row['Indice area']:.1f}/100 · contributo {row['Contributo']:.2f} punti")
+            st.progress(bounded(row['Indice area']) / 100)
+    elif section == REPORT_SECTIONS[10]:
+        defaults = list(dict.fromkeys(['Controlli generali pre-attività'] + [ACTIVITY_TO_CHECKLIST[a] for a in d['activities'] if a in ACTIVITY_TO_CHECKLIST]))
+        sections = st.multiselect('\U0001f4d1 Capitoli della checklist', list(CHECKLIST_LIBRARY), default=defaults)
+        if sections:
+            st.download_button('\U0001f4e5 Scarica checklist Word', generate_checklist_word(d, sections).getvalue(), f"Checklist_{safe_filename(d['nome'])}.docx")
+    elif section == REPORT_SECTIONS[11]:
+        st.caption('Report temporanei fino al download volontario. Il backup della singola valutazione è disponibile dopo Salva e inserisci.')
         filename = safe_filename(d['nome']) + '_' + d['month']
-        if st.button('Prepara i report completi'):
+        if st.button('Prepara i report completi', icon='\U0001f4e6'):
             with st.spinner('Preparazione report…'):
-                st.session_state.exports = dict(id=record['id'], excel=excel_report(d, r, records),
-                                                 ppt=ppt_report(d, r), word=word_report(d, r))
+                st.session_state.exports = dict(id=record['id'], excel=excel_report(d, r, records), ppt=ppt_report(d, r), word=word_report(d, r))
         exports = st.session_state.get('exports')
         if exports and exports['id'] == record['id']:
-            st.download_button('Excel completo', exports['excel'], filename + '.xlsx')
-            st.download_button('PowerPoint', exports['ppt'], filename + '.pptx')
-            st.download_button('Report Word', exports['word'], filename + '.docx')
+            st.download_button('\U0001f4ca Excel completo', exports['excel'], filename + '.xlsx')
+            st.download_button('\U0001f4fd\ufe0f PowerPoint', exports['ppt'], filename + '.pptx')
+            st.download_button('\U0001f4c4 Report Word', exports['word'], filename + '.docx')
+    st.divider()
+    st.subheader('\U0001f4be Concludi la valutazione')
+    if is_saved:
+        st.success('Valutazione già nello storico. Per una nuova prova torna al modulo e ricalcola.')
+        st.download_button('\U0001f4e5 Backup della valutazione salvata', backup_bytes([record]), f"{safe_filename(d['nome'])}_{d['month']}.json", 'application/json')
+    else:
+        st.caption('Salva e inserisci conserva input e output nello storico. Non salvare scarta la prova e svuota il modulo. '
+                   'Lo storico precedente resta disponibile; eventuali file già scaricati restano sul computer.')
+        save_col, discard_col = st.columns(2)
+        if save_col.button('Salva e inserisci', type='primary', width='stretch', icon='\U0001f4be'):
+            try:
+                store.save_many([record])
+                st.rerun()
+            except Exception:
+                st.error('Salvataggio non riuscito: prova ancora temporanea. Riprova oppure scegli Non salvare.')
+        if discard_col.button('Non salvare', width='stretch', icon='\U0001f9ea'):
+            discard_trial()
+            st.rerun()
+
+def discard_trial():
+    """Scarta solo la prova corrente, mai i record già inseriti nello storico."""
+    revision = st.session_state.get('draft_revision', 0) + 1
+    for key in list(st.session_state):
+        if key in {'draft', 'current_report', 'exports', 'advisor_reply'} or key.startswith(('nc_', 'crit_', 'awareness_')):
+            del st.session_state[key]
+    st.session_state.draft_revision = revision
+    st.session_state.trial_discarded = True
 
 
 def render_history(records):
-    st.title('Storico per cantiere')
+    st.title('\U0001f5d3\ufe0f Storico per cantiere')
     frame = history_frame(records)
     if frame.empty:
         st.info('Salva la prima valutazione per iniziare lo storico.')
@@ -1176,7 +1278,7 @@ def render_history(records):
 
 
 def render_comparison(records):
-    st.title('Confronto cantieri')
+    st.title('\U0001f4ca Confronto cantieri')
     frame = history_frame(records)
     if frame.empty:
         st.info('Servono valutazioni salvate nello storico.')
@@ -1208,7 +1310,7 @@ def render_comparison(records):
 
 
 def render_archive(store, records):
-    st.title('Archivio e backup')
+    st.title('\U0001f5c4\ufe0f Archivio e backup')
     if store.mode == 'session':
         st.warning('Modalità gratuita senza configurazione: dati disponibili solo nella sessione corrente. '
                    'Scarica il backup JSON prima di chiudere o ricaricare il browser; importalo alla prossima apertura. Non è uno storico cloud automatico.')
@@ -1243,7 +1345,7 @@ def render_archive(store, records):
 
 
 def main():
-    st.set_page_config(page_title='HSE Risk Platform', page_icon='🦺', layout='wide')
+    st.set_page_config(page_title='HSE Risk Platform', page_icon='\U0001f9ba', layout='wide')
     st.markdown(CSS, unsafe_allow_html=True)
     mode = str(setting('storage_mode', 'session')).lower()
     password = str(setting('app_password', ''))
@@ -1275,9 +1377,9 @@ def main():
     with st.sidebar:
         st.markdown('## HSE Risk Platform')
         st.caption('WIND · SOLAR · BESS')
-        page = st.radio('Navigazione', ['Valutazione mensile', 'Risultati e azioni', 'Storico cantiere', 'Confronto cantieri', 'Archivio e backup'])
+        page = st.radio('\U0001f9ed Navigazione', ['Valutazione mensile', 'Risultati e azioni', 'Storico cantiere', 'Confronto cantieri', 'Archivio e backup'], format_func=lambda label: {'Valutazione mensile':'\U0001f4dd Valutazione mensile', 'Risultati e azioni':'\U0001f3af Risultati e azioni', 'Storico cantiere':'\U0001f5d3\ufe0f Storico cantiere', 'Confronto cantieri':'\U0001f4ca Confronto cantieri', 'Archivio e backup':'\U0001f5c4\ufe0f Archivio e backup'}[label])
         st.divider()
-        st.caption(f'Modello {MODEL_VERSION} · pesi sperimentali')
+        st.caption(f'Interfaccia {UI_VERSION} · modello {MODEL_VERSION} · pesi sperimentali')
         st.caption('Periodo: un mese. Nessuna API AI. Output generati da regole esplicite.')
         st.caption('Archivio: ' + {'session':'sessione + backup portabile','sqlite':'SQLite locale','postgres':'PostgreSQL condiviso'}[mode])
         if password and st.button('Esci'):

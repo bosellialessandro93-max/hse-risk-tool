@@ -1,4 +1,4 @@
-"""HSE Risk Platform 3.1 — modello gestionale trasparente, non predittivo.
+"""HSE Risk Platform 3.2 — modello gestionale trasparente, non predittivo.
 Avvio: streamlit run app.py. Tutti gli input sono riferiti al mese selezionato.
 Nessuna chiamata a modelli AI, nessuna API a pagamento.
 """
@@ -32,7 +32,17 @@ from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.shared import Pt, Inches as DocxInches
 
 MODEL_VERSION = '2.0.0'
-UI_VERSION = '3.1.0'
+UI_VERSION = '3.2.0'
+DEFAULT_INSPECTION_TARGET = 4
+NC_FORMAL_HELP = ('Inserire solo le NC registrate in HSEQ4ALL nel periodo di analisi selezionato. '
+                  'Indicare lo stato a fine periodo e registrare ogni anomalia una sola volta, in questo elenco oppure in quello informale.')
+NC_INFORMAL_HELP = ('Inserire solo le NC non registrate in HSEQ4ALL e rilevate nel periodo di analisi selezionato. '
+                    'Indicare lo stato a fine periodo e registrare ogni anomalia una sola volta, in questo elenco oppure in quello formale.')
+STOP_POSITIVE_HELP = ('Interruzione preventiva tempestiva e gestita. Ogni Stop Work positivo riduce il Risk Index di 0,5 punti, '
+                      'fino a una riduzione complessiva di 2 punti. Non compensa le soglie minime di tutela. '
+                      'Classificare ogni evento una sola volta.')
+STOP_NEGATIVE_HELP = ('Stop imposto per carenze o mancato rispetto delle misure. Ogni Stop Work negativo aumenta il Risk Index '
+                      'di 1,5 punti, fino a un incremento complessivo di 6 punti. Classificare ogni evento una sola volta.')
 SCHEMA_VERSION = 2
 WEIGHTS = {'NC formali': 30, 'Criticità informali': 8, 'Attività': 22,
            'Interferenze': 15, 'Organizzazione': 10, 'Presidio e controlli': 15}
@@ -71,12 +81,45 @@ def safe_filename(name):
     return re.sub(r'[^\w.-]+', '_', name, flags=re.UNICODE).strip('_')[:90] or 'cantiere'
 
 
+def analysis_period(d):
+    dt = datetime.strptime(d['month'], '%Y-%m')
+    names = ['gennaio', 'febbraio', 'marzo', 'aprile', 'maggio', 'giugno',
+             'luglio', 'agosto', 'settembre', 'ottobre', 'novembre', 'dicembre']
+    last = calendar.monthrange(dt.year, dt.month)[1]
+    return f"{names[dt.month-1]} {dt.year} (01/{dt.month:02d}/{dt.year} - {last:02d}/{dt.month:02d}/{dt.year})"
+
+
+def detection_details(d):
+    target = int(d.get('inspection_target', DEFAULT_INSPECTION_TARGET))
+    coverage = min(1., d['inspections'] / target)
+    deficit = 100 * (1 - coverage)
+    return dict(target=target, coverage=coverage * 100, deficit=deficit,
+                points=deficit * .35 * .15)
+
+
+def detection_help(target=DEFAULT_INSPECTION_TARGET):
+    return (f'Inserire solo le ispezioni registrate in HSEQ4ALL nel periodo di analisi. '
+            f'Detection convenzionale = min(ispezioni / {target}, 1) × 100. '
+            'Deficit di detection = 100 − detection. Il deficit pesa il 35% nell’area Presidio e controlli, '
+            'che pesa il 15% sul Risk Index: al massimo 5,25 punti. '
+            f'Con 0 ispezioni il contributo è +5,25 punti; con almeno {target} è 0. '
+            'Il riferimento è gestionale, non un requisito normativo né una probabilità statistica di rilevazione. '
+            'Il rapporto NC/ispezioni è solo descrittivo: rilevare più NC non penalizza l’efficacia delle ispezioni. '
+            'Le esposizioni facoltative cambiano soltanto l’indice contestualizzato separato.')
+
+
+def scorecard_stars(area_index):
+    """Più stelle = minore indice di attenzione dell’area, con arrotondamento a 20 punti."""
+    filled = max(0, min(5, int((100 - bounded(area_index)) / 20 + .5)))
+    return filled, '★' * filled + '☆' * (5 - filled)
+
+
 def default_data():
     today = date.today().replace(day=1)
     last_month = date(today.year - (today.month == 1), 12 if today.month == 1 else today.month - 1, 1)
     return dict(nome='', technology='Wind', fase='costruzione', month=last_month.isoformat()[:7],
                 app=1, sub=0, company_hse=1, hse_coverage=80., inspections=0,
-                inspection_target=4, activities=['civili'], interference_level=3,
+                inspection_target=DEFAULT_INSPECTION_TARGET, activities=['civili'], interference_level=3,
                 nc_items=[], crit_items=[], awareness=[], stop_positive=0, stop_negative=0,
                 imminent_danger=False, hours=None, workers=None, days=None, notes='')
 
@@ -253,7 +296,7 @@ def calculate_risk(d):
         'Attività: massima pericolosità convenzionale + 3 per ogni tipologia aggiuntiva, massimo 100; peso 22%.',
         'Interferenze: (livello − 1)/9 × 100, peso 15%. Non viene riapplicata la pericolosità delle attività.',
         'Organizzazione: 100 × (1 − exp(−(appaltatori−1 + 1,2×subappaltatori)/8)), peso 10%.',
-        f'Presidio: 65% deficit copertura HSE + 35% deficit ispezioni rispetto al target dichiarato ({d["inspection_target"]}); peso 15%.',
+        f'Presidio: 65% deficit copertura HSE + 35% deficit ispezioni rispetto al riferimento gestionale ({d["inspection_target"]}); peso 15%.',
         'Nessun malus sul rapporto NC/ispezioni: rilevare più anomalie non rende meno efficace il controllo. Il rapporto resta descrittivo.',
         f'Sensibilizzazioni: −{awareness:.2f}/8. Copertura ponderata dei temi necessari; continuità da 0,7 a 1; copertura non nota usa fattore prudenziale 0,5.',
         f'Stop Work: positivi −{positive:.2f}/2; negativi +{negative:.2f}/6. Ogni evento va classificato una sola volta; anomalia sottostante registrata una sola volta.',
@@ -395,15 +438,23 @@ def action_plan(d, r):
 def executive_summary(d, r):
     top = sorted(r['drivers'][:6], key=lambda x: x['Contributo'], reverse=True)[:3]
     nc_counts, crit_counts = anomaly_counts(d['nc_items']), anomaly_counts(d['crit_items'])
-    text = (f"{d['nome']} — {d['technology']}, {d['month']}: indice base {r['score']:.1f}/100 ({r['level']}). "
-            'I contributi principali sono ' + ', '.join(f"{x['Area']} ({x['Contributo']:.1f} punti)" for x in top) + '. ')
+    text = (f"Il cantiere di {d['nome']}, tecnologia {d['technology']}, ha generato per il periodo di analisi "
+            f"{analysis_period(d)} un Risk Index pari a {r['score']:.1f}/100, fascia {r['level']}. "
+            f"Il cantiere si trova nella fase di {d['fase']}, con le seguenti lavorazioni: "
+            + ', '.join(d['activities']) + '. ')
+    text += (f"Sono state inserite {nc_counts['total']} NC formali ({nc_counts['open']} aperte e {nc_counts['closed']} chiuse) "
+             f"e {crit_counts['total']} criticità informali ({crit_counts['open']} aperte e {crit_counts['closed']} chiuse). ")
+    themes = sorted({x['theme'] for x in d['nc_items'] + d['crit_items']})
+    if themes:
+        text += 'Le segnalazioni riguardano: ' + ', '.join(themes) + '. '
+    text += (f"Le ispezioni registrate in HSEQ4ALL nel periodo sono {d['inspections']}. "
+             f"Operano {d['app']} imprese appaltatrici e {d['sub']} subappaltatrici, "
+             f"con una copertura HSE effettiva dichiarata del {d['hse_coverage']:.0f}%. ")
+    text += 'I contributi principali al punteggio sono ' + ', '.join(f"{x['Area']} ({x['Contributo']:.1f} punti)" for x in top) + '. '
     if r['floor']:
         text += f"È attiva la soglia minima {r['floor']:.0f}: {r['floor_reason']}. "
-    text += (f"NC formali: {nc_counts['total']} totali, {nc_counts['open']} aperte, {nc_counts['closed']} chiuse. "
-             f"Criticità informali: {crit_counts['total']} totali, {crit_counts['open']} aperte, {crit_counts['closed']} chiuse. ")
-    text += f"Le sensibilizzazioni pertinenti riducono l’indice di {r['awareness_bonus']:.1f} punti. "
-    if r['missing']:
-        text += 'Qualità del dato: ' + ' '.join(r['missing'])
+    text += (f"Sono dichiarati {d['stop_positive']} Stop Work positivi e {d['stop_negative']} negativi. "
+             f"Le sensibilizzazioni pertinenti riducono l’indice di {r['awareness_bonus']:.1f} punti.")
     return text
 
 
@@ -642,43 +693,217 @@ def excel_report(d, r, records):
     return buffer.getvalue()
 
 
+def _visual_font(size, bold=False):
+    from PIL import ImageFont
+    candidates = (['DejaVuSans-Bold.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+                   '/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf', 'C:/Windows/Fonts/arialbd.ttf'] if bold else
+                  ['DejaVuSans.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+                   '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf', 'C:/Windows/Fonts/arial.ttf'])
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            pass
+    return ImageFont.load_default(size=size)
+
+
+def output_visuals(d, r):
+    """Immagini PNG dei risultati calcolati. Stesse grandezze dei grafici e delle scorecard del tool."""
+    from PIL import Image, ImageDraw
+    ink, muted, teal, pale = '#16354B', '#536B7D', '#087F8C', '#EAF1F6'
+    result = {}
+
+    def base(title, subtitle):
+        im = Image.new('RGB', (1600, 900), 'white')
+        draw = ImageDraw.Draw(im)
+        draw.text((64, 38), title, font=_visual_font(46, True), fill=ink)
+        draw.text((66, 107), subtitle, font=_visual_font(24), fill=muted)
+        return im, draw
+
+    def save(name, im):
+        out = BytesIO()
+        im.save(out, format='PNG')
+        result[name] = out.getvalue()
+
+    im, draw = base('Risk Index', f"Periodo {d['month']} - indice gestionale su scala 0-100")
+    score = bounded(r['score'])
+    color = COLORS[min(4, max(0, math.ceil(score / 20) - 1))]
+    draw.arc((100, 185, 690, 775), 0, 360, fill=pale, width=54)
+    if score > 0:
+        draw.arc((100, 185, 690, 775), -90, -90 + score * 3.6, fill=color, width=54)
+    draw.text((395, 430), f"{score:.1f}", anchor='mm', font=_visual_font(112, True), fill=color)
+    draw.text((395, 535), 'SU 100', anchor='mm', font=_visual_font(31), fill=muted)
+    draw.text((810, 235), r['level'], font=_visual_font(64, True), fill=color)
+    for i, t in enumerate(['Valore alto = maggiore attenzione HSE', 'Indice base per confronti omogenei', 'Nessuna probabilità di infortunio stimata']):
+        draw.text((815, 355 + i * 65), t, font=_visual_font(28), fill=ink)
+    context = 'Dati facoltativi non inseriti' if r['context_score'] is None else f"Indice contestualizzato: {r['context_score']:.1f}/100"
+    draw.text((815, 590), context, font=_visual_font(27, True), fill=teal)
+    if r['floor']:
+        draw.text((815, 650), f"Soglia minima attiva: {r['floor']:.0f}", font=_visual_font(28, True), fill='#B83246')
+    draw.text((66, 840), 'Basso 0-20   Medio basso >20-40   Medio >40-60   Alto >60-80   Critico >80-100', font=_visual_font(24), fill=muted)
+    save('risk', im)
+
+    im, draw = base('Contributi al Risk Index', 'Punti effettivi, incluse riduzioni e soglie minime')
+    rows = r['drivers']
+    lo = min(-1., min(x['Contributo'] for x in rows)); hi = max(1., max(x['Contributo'] for x in rows))
+    left, right = 535, 1410
+    project = lambda value: left + (value - lo) / (hi - lo) * (right - left)
+    zero = project(0)
+    draw.line((zero, 173, zero, 830), fill='#CCD9E2', width=2)
+    for i, row in enumerate(rows):
+        y = 182 + i * 58
+        draw.text((64, y+4), row['Area'], font=_visual_font(25), fill=ink)
+        value = row['Contributo']; x = project(value)
+        if abs(value) > .00001:
+            draw.rounded_rectangle((min(zero, x), y, max(zero, x), y+33), radius=5, fill='#16826B' if value < 0 else '#225873')
+        else:
+            draw.ellipse((zero-3, y+13, zero+3, y+19), fill='#9DAFBD')
+        draw.text((1460, y+3), f'{value:+.2f}', font=_visual_font(25, True), fill=ink)
+    save('drivers', im)
+
+    im, draw = base('Segnalazioni del periodo', 'NC formali e criticità informali - conteggi per stato')
+    series = [anomaly_counts(d['nc_items']), anomaly_counts(d['crit_items'])]
+    limit = max(1, *(x[k] for x in series for k in ['open', 'closed']))
+    for i, (title, counts) in enumerate(zip(['NC formali', 'Criticità informali'], series)):
+        x = 90 + i * 785
+        draw.text((x, 202), title, font=_visual_font(36, True), fill=ink)
+        draw.text((x, 267), f"Totale {counts['total']}", font=_visual_font(31), fill=muted)
+        for j, (key, label, col) in enumerate([('open', 'Aperte', '#D46B22'), ('closed', 'Chiuse', '#16826B')]):
+            y = 385 + j * 170
+            draw.text((x, y-50), f"{label}: {counts[key]}", font=_visual_font(31, True), fill=col)
+            draw.rounded_rectangle((x, y, x+590, y+44), radius=7, fill=pale)
+            if counts[key]:
+                draw.rounded_rectangle((x, y, x+590*counts[key]/limit, y+44), radius=7, fill=col)
+    draw.text((90, 820), 'Le chiuse mantengono un contributo ridotto. Il registro conserva tutti i dettagli.', font=_visual_font(25), fill=muted)
+    save('anomalies', im)
+
+    im, draw = base('HSE Scorecard', 'Più stelle = minore indice di attenzione dell’area. Scala da 0 a 5 stelle.')
+    def star(cx, cy, filled):
+        points = [(cx + (23 if i % 2 == 0 else 10) * math.cos(-math.pi/2 + i*math.pi/5),
+                   cy + (23 if i % 2 == 0 else 10) * math.sin(-math.pi/2 + i*math.pi/5)) for i in range(10)]
+        draw.polygon(points, fill='#B38212' if filled else '#E2E8ED')
+    for i, row in enumerate(r['drivers'][:6]):
+        x, y = 65 + (i % 2)*790, 190 + (i//2)*220
+        draw.text((x, y), row['Area'], font=_visual_font(31, True), fill=ink)
+        count, _ = scorecard_stars(row['Indice area'])
+        for j in range(5):
+            star(x+24+j*59, y+80, j<count)
+        draw.text((x, y+125), f"Indice area {row['Indice area']:.1f}/100   Contributo {row['Contributo']:.2f} pt", font=_visual_font(25), fill=muted)
+    save('scorecard', im)
+    return result
+
+
 def ppt_report(d, r):
+    """Export 16:9, con riepilogo dinamico e immagini PNG dei risultati, senza servizi esterni."""
+    from pptx.enum.shapes import MSO_SHAPE
     prs = Presentation()
     prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
-    pages = [('HSE Risk Platform', f"{d['nome']} | {d['technology']} | {d['month']}\nIndice {r['score']:.1f}/100 — {r['level']}\nModello gestionale {MODEL_VERSION}"),
-             ('Sintesi del mese', executive_summary(d, r)),
-             ('Contributi al punteggio', '\n'.join(f"{x['Area']}: {x['Contributo']:+.1f} punti" for x in r['drivers'])),
-             ('Priorità operative', '\n'.join(f"{x['Priorità']} · {x['Area']}: {x['Azione']}" for x in action_plan(d, r)[:5])),
-             ('Metodo e limiti', '\n'.join(r['explanations'][-3:]) + '\nIndice base per confronto; contestualizzato separato.\nNessuna validazione predittiva disponibile.')]
-    for theme in sorted(r['needs'], key=r['needs'].get, reverse=True)[:3]:
-        title, points, question = TOOLBOX_CONTENT[theme]
-        pages.append(('Toolbox | ' + theme, title + '\n\n' + '\n'.join(points) + '\n\n' + question))
+    visuals = output_visuals(d, r)
+    navy, teal, muted = '16354B', '087F8C', '536B7D'
+
+    def text(slide, value, x, y, w, h, size=20, bold=False, color=navy):
+        box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+        tf = box.text_frame
+        tf.word_wrap = True
+        tf.margin_left = tf.margin_right = Inches(.02)
+        tf.margin_top = tf.margin_bottom = Inches(.02)
+        for i, line in enumerate(value.split('\n')):
+            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+            p.text = line; p.font.name = 'Aptos'; p.font.size = PptPt(size)
+            p.font.bold = bold; p.font.color.rgb = RGBColor.from_string(color)
+            p.space_after = PptPt(3); p.line_spacing = 1.12
+        return box
+
+    def slide(title, subtitle=''):
+        s = prs.slides.add_slide(prs.slide_layouts[6])
+        s.background.fill.solid(); s.background.fill.fore_color.rgb = RGBColor.from_string('FFFFFF')
+        text(s, title, .65, .4, 12.0, .7, 32, True)
+        if subtitle:
+            text(s, subtitle, .68, 1.15, 12., .45, 14, color=muted)
+        text(s, f"HSE Risk Platform {UI_VERSION}   Modello {MODEL_VERSION}   {d['month']}", .68, 7.1, 11., .22, 10, color=muted)
+        text(s, str(len(prs.slides)), 12.2, 7.1, .4, .22, 10, color=muted)
+        return s
+
+    def picture_slide(title, key, subtitle=''):
+        s = slide(title, subtitle)
+        s.shapes.add_picture(BytesIO(visuals[key]), Inches(2.026), Inches(1.7), width=Inches(9.28))
+        return s
+
+    def wrap_measured(value, size=19, inches=11.9):
+        # Misura conservativa in punti; protegge anche da parole/identificativi senza spazi.
+        font = _visual_font(size * 4)
+        limit = (inches * 72 - 8) * 4 * .93
+        lines = []
+        for paragraph in str(value).splitlines() or ['']:
+            line = ''
+            for word in paragraph.split():
+                candidate = (line + ' ' + word).strip()
+                if font.getlength(candidate) <= limit:
+                    line = candidate
+                    continue
+                if line:
+                    lines.append(line); line = ''
+                for char in word:
+                    if line and font.getlength(line + char) > limit:
+                        lines.append(line); line = char
+                    else:
+                        line += char
+            lines.append(line)
+        return lines
+
+    def paragraphs_slides(title, paragraphs, max_lines=13):
+        # Mantiene intere le azioni brevi; divide solo i paragrafi troppo lunghi per una slide.
+        pages, current = [], []
+        for paragraph in paragraphs:
+            block = wrap_measured(paragraph)
+            if current and len(current) + 1 + len(block) > max_lines:
+                pages.append(current); current = []
+            while len(block) > max_lines:
+                pages.append(block[:max_lines]); block = block[max_lines:]
+            if block:
+                if current:
+                    current.append('')
+                current.extend(block)
+        if current:
+            pages.append(current)
+        for i, lines in enumerate(pages or [['Nessuna voce presente.']]):
+            s = slide(title + (' - continua' if i else ''))
+            text(s, '\n'.join(lines), .7, 1.65, 11.9, 5.25, 19)
+
+    # La copertina contiene il riepilogo richiesto; il nome completo resta nel testo.
+    cover = slide('Sintesi del cantiere', f"{d['technology']}   {analysis_period(d)}")
+    summary = executive_summary(d, r).split('I contributi principali al punteggio sono ')[0].strip()
+    summary_lines = wrap_measured(summary, size=18)
+    text(cover, '\n'.join(summary_lines), .7, 1.85, 11.9, 4.85,
+         18 if len(summary_lines) <= 13 else 16)
+    # Le eventuali informazioni di qualità del dato sono riportate nelle pagine di lettura.
+    picture_slide('Risk Index del periodo', 'risk')
+    picture_slide('Analisi dei contributi', 'drivers')
+    picture_slide('NC formali e criticità informali', 'anomalies')
+    picture_slide('Scorecard delle aree', 'scorecard')
+    detect = detection_details(d)
+    paragraphs_slides('Ispezioni e detection', [
+        f"Ispezioni registrate in HSEQ4ALL: {d['inspections']} nel periodo {d['month']}.",
+        f"Riferimento gestionale {detect['target']}. Detection convenzionale {detect['coverage']:.0f}%. "
+        f"Deficit {detect['deficit']:.0f}%. Contributo del deficit ispettivo: +{detect['points']:.2f} punti.",
+        'La detection è un indicatore convenzionale di copertura del riferimento ispettivo. Il rapporto NC/ispezioni resta descrittivo.',
+        *r['missing']])
+    actions = action_plan(d, r)
+    paragraphs_slides('Priorità operative', [f"{x['Priorità']} - {x['Area']}: {x['Azione']}\n"
+        f"Responsabile proposto: {x['Responsabile']}. Termine proposto: {x['Termine']}." for x in actions]
+        or ['Nessuna azione specifica generata. Mantenere il presidio e verificare le misure.'])
     for field, title in [('nc_items', 'Registro NC formali'), ('crit_items', 'Registro criticità informali')]:
         counts = anomaly_counts(d[field])
-        body = f"Totale {counts['total']} · Aperte {counts['open']} · Chiuse {counts['closed']}\n" + '\n'.join(f"{e['theme']} | {e['severity']} | {e['status']}: {e.get('note', '')}" for e in d[field])
-        pages.append((title, body))
-    paginated = []
-    for title, body in pages:
-        lines = []
-        for paragraph in body.splitlines():
-            lines.extend(textwrap.wrap(paragraph, width=102) or [''])
-        for start in range(0, len(lines), 15):
-            paginated.append((title + (' · continua' if start else ''), '\n'.join(lines[start:start+15])))
-    for title, body in paginated:
-        slide = prs.slides.add_slide(prs.slide_layouts[6])
-        fill = slide.background.fill
-        fill.solid()
-        fill.fore_color.rgb = RGBColor.from_string('F3F6FA')
-        for top, height, text, size, color in [(0.55, 1., title, 30, '123047'), (1.7, 5., body, 18, '254559')]:
-            box = slide.shapes.add_textbox(Inches(.7), Inches(top), Inches(11.9), Inches(height))
-            tf = box.text_frame
-            tf.word_wrap = True
-            for i, line in enumerate(text.splitlines()):
-                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                p.text = line
-                p.font.size = PptPt(size)
-                p.font.color.rgb = RGBColor.from_string(color)
-                p.space_after = PptPt(10)
+        paragraphs_slides(title, [f"Totale {counts['total']}. Aperte {counts['open']}. Chiuse {counts['closed']}."] +
+            [f"{i}. {e['theme']} / gravità {e['severity']} / {e['status']}: {e.get('note', '')}" for i,e in enumerate(d[field],1)])
+    for theme in sorted(r['needs'], key=r['needs'].get, reverse=True)[:3]:
+        title, points, question = TOOLBOX_CONTENT[theme]
+        paragraphs_slides('Toolbox su ' + theme, [title, *points, question])
+    paragraphs_slides('Metodo e lettura del risultato', [
+        'Il Risk Index è un indice gestionale di priorità HSE su scala 0-100. Un valore maggiore richiede maggiore attenzione.',
+        'Pesi, soglie e target sono convenzioni gestionali da calibrare. Il risultato non è una probabilità di infortunio.',
+        f"Soglia minima: {r['floor']:.0f}. {r['floor_reason']}.",
+        'Indice base per confronti omogenei. Indice contestualizzato separato per le esposizioni facoltative.'])
     buffer = BytesIO()
     prs.save(buffer)
     return buffer.getvalue()
@@ -956,6 +1181,19 @@ h1,h2,h3{color:#123047;letter-spacing:-.025em}
 .week-day h4{font-size:1rem;margin:0 0 12px;color:#123047}
 .event{background:#fff;border-left:4px solid #087f8c;border-radius:6px;padding:10px;margin-bottom:10px;overflow-wrap:anywhere;font-size:.88rem}
 .event span{display:inline-block;margin-top:6px;color:#225873}.event small,.muted{color:#415c70;font-size:.8rem}
+.risk-overview{display:grid;grid-template-columns:220px 1fr;gap:30px;background:#fff;border:1px solid #dbe5ec;border-radius:20px;padding:28px;margin:18px 0 24px;box-shadow:0 10px 30px #12304709}
+.risk-number{font-size:4.4rem;line-height:1;font-weight:800;letter-spacing:-.06em;color:var(--risk-color)}
+.risk-number small{font-size:1.2rem;letter-spacing:0;color:#607384;font-weight:500}
+.risk-label{font-size:.78rem;letter-spacing:.13em;font-weight:700;color:#526879;margin-bottom:14px}
+.risk-level{color:var(--risk-color);font-size:1.1rem;font-weight:750;margin-top:12px}
+.risk-explanation h3{margin:0 0 8px;font-size:1.35rem}.risk-explanation p{color:#40596c;line-height:1.6;margin:0 0 10px}
+.risk-spectrum{height:10px;position:relative;border-radius:8px;margin:20px 6px 9px;background:linear-gradient(to right,#16826b 0% 20%,#4b8b9e 20% 40%,#b38212 40% 60%,#d46b22 60% 80%,#b83246 80% 100%)}
+.risk-marker{position:absolute;top:-4px;width:5px;height:18px;background:#123047;border:1px solid white;border-radius:3px;transform:translateX(-50%)}
+.risk-scale{display:flex;justify-content:space-between;color:#536b7d;font-size:.75rem}
+.score-card{padding:22px;background:white;border:1px solid #dbe5ec;border-radius:14px;margin:0 0 16px;border-top:4px solid var(--area-color)}
+.score-card h4{margin:0 0 12px;font-size:1.02rem;color:#123047}.score-card .stars{font-size:1.8rem;color:#aa7704;letter-spacing:4px;line-height:1.4}.score-card p{color:#496174;font-size:.88rem;margin:8px 0 0}
+.score-card strong{font-size:1.4rem;color:#123047}.report-heading{margin-top:16px}
+@media(max-width:700px){.risk-overview{grid-template-columns:1fr;padding:20px;gap:18px}.risk-number{font-size:3.8rem}}
 @media(max-width:850px){.week-grid{grid-template-columns:repeat(2,minmax(140px,1fr))}}
 </style>'''
 
@@ -992,7 +1230,8 @@ def card_editor(label, rows, key, awareness=False):
     state_key = key + '_cards'
     if state_key not in st.session_state:
         st.session_state[state_key] = [{'uid': uuid.uuid4().hex, **deepcopy(x)} for x in rows]
-    st.markdown('### ' + label)
+    section_help = None if awareness else NC_FORMAL_HELP if key.startswith('nc_') else NC_INFORMAL_HELP
+    st.subheader(label, help=section_help)
     entries = st.session_state[state_key]
     if not entries:
         st.info('Nessuna voce inserita. Usa il pulsante Aggiungi qui sotto per creare la prima scheda.')
@@ -1039,8 +1278,8 @@ def render_form(records):
     rev = st.session_state.get('draft_revision', 0)
     st.title('\U0001f4dd Valutazione mensile')
     st.caption('WIND / SOLAR / BESS · Input riferiti esclusivamente al mese selezionato')
-    st.info('Registrare ogni anomalia una sola volta: NC formale oppure criticità informale. '
-            'Per gli eventi precedenti riportare solo quelli ancora aperti a fine mese; non ricontare le chiusure dei mesi precedenti.')
+    st.info('Inserisci i dati del solo periodo selezionato. NC formali: registrate in HSEQ4ALL nel periodo. '
+            'Criticità informali: rilevate nel periodo e non registrate in HSEQ4ALL. Ogni anomalia va inserita una sola volta.')
     names = sorted({x['data']['nome'] for x in records}, key=str.casefold)
     if names:
         with st.expander('Usa il nome di un cantiere già presente'):
@@ -1064,8 +1303,8 @@ def render_form(records):
         st.subheader('\U0001f50d 3 · Anomalie e follow-up')
         st.caption('Usa Aggiungi per ogni segnalazione e compila la scheda. Aperte = presenti a fine mese; chiuse = risolte durante il mese. Gravità alta = potenziale danno grave, da motivare nella descrizione. '
                    'Criticità informali: peso inferiore, nessuna soglia automatica. Se formalizzate, rimuoverle dalla tabella informale.')
-        nc = anomaly_editor('\U0001f4dd NC formali · massimo 30 punti', d['nc_items'], f'nc_{rev}')
-        crit = anomaly_editor('\U0001f4cc Criticità informali · massimo 8 punti', d['crit_items'], f'crit_{rev}')
+        nc = anomaly_editor('\U0001f4dd NC formali', d['nc_items'], f'nc_{rev}')
+        crit = anomaly_editor('\U0001f4cc Criticità informali', d['crit_items'], f'crit_{rev}')
         danger = st.checkbox('È ancora presente un pericolo grave e attuale a fine valutazione', value=d['imminent_danger'],
            help='Attiva un allarme dedicato e un indice minimo 81. Non dipende dal canale formale/informale di registrazione.')
         st.subheader('\U0001f477 4 · Organizzazione e presidio')
@@ -1075,16 +1314,15 @@ def render_form(records):
         hse = c.number_input('Professionisti HSE delle imprese', 0, 200, int(d['company_hse']), help='Dato descrittivo; non equivale a copertura reale.')
         coverage = st.slider('Copertura HSE effettiva delle lavorazioni (%)', 0, 100, int(d['hse_coverage']),
           help='Quota delle lavorazioni/turni/aree per cui è stato assicurato il presidio HSE pianificato. Stima dichiarata, non numero di persone e non criterio normativo universale.')
-        a, b = st.columns(2)
-        inspections = a.number_input('Ispezioni strutturate eseguite nel mese', 0, 2000, int(d['inspections']))
-        target = b.number_input('Target mensile ispezioni · politica comune di confronto', 1, 1000, int(d['inspection_target']),
-          help='Default 4 è una ipotesi gestionale. Per graduatorie omogenee usare lo stesso target; il confronto esclude target diversi.')
+        target = DEFAULT_INSPECTION_TARGET
+        inspections = st.number_input('Numero di ispezioni registrate in HSEQ4ALL', 0, 2000, int(d['inspections']),
+                                      help=detection_help(target))
         st.subheader('\u26d4 5 · Stop Work')
         st.caption('Positivo: interruzione preventiva tempestiva e gestita. Negativo: stop imposto per carenza o mancato rispetto di misure. '
                    'Classificare ciascun evento in una sola categoria; registrare una sola volta anche l’anomalia sottostante. La classificazione resta responsabilità dell’utilizzatore.')
         a, b = st.columns(2)
-        positive = a.number_input('Stop Work positivi · massimo −2', 0, 1000, int(d['stop_positive']))
-        negative = b.number_input('Stop Work negativi · massimo +6', 0, 1000, int(d['stop_negative']))
+        positive = a.number_input('Stop Work positivi', 0, 1000, int(d['stop_positive']), help=STOP_POSITIVE_HELP)
+        negative = b.number_input('Stop Work negativi', 0, 1000, int(d['stop_negative']), help=STOP_NEGATIVE_HELP)
         st.subheader('\U0001f9e0 6 · Sensibilizzazioni mirate')
         st.caption('Una scheda per tema. Copertura = % di lavoratori destinatari unici raggiunti sul tema nel mese (non somma delle presenze). '
                    'Lasciare vuota se sconosciuta: fattore prudenziale 50%. Senza collegamento ad attività, anomalie aperte o fase non c’è bonus.')
@@ -1103,7 +1341,8 @@ def render_form(records):
             app=app, sub=sub, company_hse=hse, hse_coverage=coverage, inspections=inspections,
             inspection_target=target, activities=activities, interference_level=interference,
             nc_items=nc, crit_items=crit, awareness=awareness, stop_positive=positive, stop_negative=negative,
-            imminent_danger=danger, hours=hours or None, workers=workers or None, days=days or None, notes=notes)
+            imminent_danger=danger, hours=hours or None, workers=workers or None, days=days or None, notes=notes,
+            input_scope='month_registrations_v1')
         errors = validate_data(candidate)
         if errors:
             for error in errors:
@@ -1113,6 +1352,7 @@ def render_form(records):
             st.session_state.pop('trial_discarded', None)
             st.session_state.pop('exports', None)
             st.session_state.pop('advisor_reply', None)
+            st.session_state.pop('report_section', None)
             st.session_state.current_report = new_record(candidate, calculate_risk(candidate))
             st.success('Prova calcolata, non salvata. Apri “Risultati e azioni”; al termine scegli Salva e inserisci oppure Non salvare.')
 
@@ -1155,9 +1395,31 @@ def render_report(store, records):
     d, r = record['data'], record['result']
     st.subheader(f"{d['nome']} · {d['technology']} · {d['month']}")
     st.caption(f"Interfaccia {UI_VERSION} · modello {MODEL_VERSION} · snapshot calcolato: dopo modifiche al modulo premi nuovamente Calcola.")
-    a, b = st.columns(2)
-    a.metric('\U0001f4c8 Indice base', f"{r['score']:.1f} / 100", r['level'], delta_color='off')
-    b.metric('\U0001f50e Indice contestualizzato', '—' if r['context_score'] is None else f"{r['context_score']:.1f} / 100")
+    color = COLORS[min(4, max(0, math.ceil(r['score'] / 20) - 1))]
+    interpretation = {'Basso':'Mantenere il presidio e verificare le condizioni operative.',
+                      'Medio basso':'Concentrare il follow-up sulle aree che contribuiscono maggiormente.',
+                      'Medio':'Pianificare gli interventi sulle priorità e verificarne l’attuazione.',
+                      'Alto':'Dare priorità alle condizioni aperte e rafforzare il presidio operativo.',
+                      'Critico':'Gestire subito le condizioni prioritarie con i responsabili competenti.'}[r['level']]
+    st.markdown(f'''<section class="risk-overview" style="--risk-color:{color}">
+      <div><div class="risk-label">RISK INDEX · INDICE BASE</div>
+      <div class="risk-number">{r['score']:.1f}<small> / 100</small></div>
+      <div class="risk-level">{html.escape(r['level'])}</div></div>
+      <div class="risk-explanation"><h3>Come leggere il risultato</h3>
+      <p>Il Risk Index sintetizza la priorità gestionale HSE del cantiere nel periodo analizzato.
+      Un valore più alto indica maggiore attenzione richiesta. Non è una percentuale di probabilità di infortunio.</p>
+      <p><strong>{html.escape(interpretation)}</strong></p>
+      <div class="risk-spectrum"><span class="risk-marker" style="left:{bounded(r['score'])}%"></span></div>
+      <div class="risk-scale"><span>0 · Basso</span><span>40 · Medio</span><span>80 · Critico</span><span>100</span></div>
+      </div></section>''', unsafe_allow_html=True)
+    st.subheader('\U0001f3d7\ufe0f Il cantiere nel periodo di analisi')
+    st.write(executive_summary(d, r))
+    if r['context_score'] is not None:
+        st.info(f"Indice contestualizzato: {r['context_score']:.1f}/100. Usa i dati di esposizione facoltativi. "
+                'Per confrontare tutti i cantieri usa il Risk Index base.')
+    else:
+        st.caption('Indice contestualizzato non disponibile: non sono stati inseriti dati di esposizione. Il Risk Index base è calcolato.')
+    st.subheader('\U0001f4cb Segnalazioni del periodo')
     nc, crit = anomaly_counts(d['nc_items']), anomaly_counts(d['crit_items'])
     a, b, c = st.columns(3)
     a.metric('\U0001f4dd NC formali totali', nc['total'])
@@ -1187,7 +1449,8 @@ def render_report(store, records):
     st.caption('12 sezioni dedicate: sintesi, alert, piano azioni, registro, motivazioni, toolbox, scenari, calcolo, advisor, scorecard, checklist ed export.')
     actions = action_plan(d, r)
     if section == REPORT_SECTIONS[0]:
-        st.write(executive_summary(d, r))
+        st.write('Le barre mostrano quanto ogni area contribuisce al Risk Index. I valori negativi rappresentano riduzioni. '
+                 'La soglia minima, se attiva, può mantenere elevato il risultato anche in presenza di bonus.')
         st.altair_chart(driver_chart(r), width='stretch')
         st.caption('Contributi effettivi, incluse le rettifiche per limite di scala e soglia minima.')
         nc_driver = next(x for x in r['drivers'] if x['Area'] == 'NC formali')
@@ -1253,6 +1516,12 @@ def render_report(store, records):
         st.dataframe(pd.DataFrame(r['drivers']), hide_index=True, width='stretch')
         for text in r['explanations']:
             st.write('• ' + text)
+        detect = detection_details(d)
+        st.markdown('### \U0001f50e Detection delle ispezioni')
+        st.write(f"{d['inspections']} ispezioni HSEQ4ALL nel periodo · riferimento {detect['target']} · "
+                 f"copertura convenzionale {detect['coverage']:.0f}% · deficit {detect['deficit']:.0f}% · "
+                 f"contributo del solo deficit ispettivo +{detect['points']:.2f} punti.")
+        st.caption(detection_help(detect['target']))
         st.markdown('### \U0001f50e Dati facoltativi e qualità del dato')
         st.write(r['context_basis'])
         if r['context_target'] is not None:
@@ -1261,7 +1530,9 @@ def render_report(store, records):
             st.warning(text)
         st.write('NC/ispezioni (descrittivo): ' + (f"{len(d['nc_items']) / d['inspections']:.2f}" if d['inspections'] else 'non valutabile'))
         if d['hours']:
-            st.write(f"NC formali / 10.000 ore: {len(d['nc_items']) / d['hours'] * 10000:.2f}; include arretrato aperto, non è un tasso di nuove NC.")
+            basis = ('NC registrate nel periodo' if d.get('input_scope') == 'month_registrations_v1'
+                     else 'valutazione precedente: può includere arretrato aperto')
+            st.write(f"NC formali / 10.000 ore: {len(d['nc_items']) / d['hours'] * 10000:.2f}; {basis}. Indicatore descrittivo.")
     elif section == REPORT_SECTIONS[8]:
         st.caption('Assistente locale a regole, senza API AI. Spiega indice, azioni, presidio e temi dei toolbox.')
         q = st.text_input('\U0001f4ac Domanda sul report', max_chars=500)
@@ -1271,10 +1542,18 @@ def render_report(store, records):
         if reply and reply[0] == record['id']:
             st.markdown(reply[1])
     elif section == REPORT_SECTIONS[9]:
-        st.caption('Indici area 0–100: più alto significa maggiore attenzione. La scorecard usa gli stessi fattori della formula.')
-        for row in r['drivers'][:6]:
-            st.write(f"{row['Area']}: {row['Indice area']:.1f}/100 · contributo {row['Contributo']:.2f} punti")
-            st.progress(bounded(row['Indice area']) / 100)
+        st.caption('Le stelle sintetizzano il controllo convenzionale dell’area: più stelle = minore indice di attenzione. '
+                   'Da 0 a 5 stelle, arrotondate rispetto a (100 − indice area) / 20. Il Risk Index segue la scala opposta: più alto = maggiore attenzione.')
+        cols = st.columns(2)
+        for i, row in enumerate(r['drivers'][:6]):
+            filled, stars = scorecard_stars(row['Indice area'])
+            area_color = COLORS[min(4, max(0, math.ceil(row['Indice area'] / 20) - 1))]
+            with cols[i % 2]:
+                st.markdown(f'''<article class="score-card" style="--area-color:{area_color}">
+                  <h4>{html.escape(row['Area'])}</h4><div class="stars" aria-label="{filled} stelle su 5">{stars}</div>
+                  <p>Indice di attenzione <strong>{row['Indice area']:.1f}/100</strong></p>
+                  <p>Contributo al Risk Index <b>{row['Contributo']:.2f} punti</b> · peso {row['Peso massimo']}%</p>
+                  </article>''', unsafe_allow_html=True)
     elif section == REPORT_SECTIONS[10]:
         defaults = list(dict.fromkeys(['Controlli generali pre-attività'] + [ACTIVITY_TO_CHECKLIST[a] for a in d['activities'] if a in ACTIVITY_TO_CHECKLIST]))
         sections = st.multiselect('\U0001f4d1 Capitoli della checklist', list(CHECKLIST_LIBRARY), default=defaults)
@@ -1335,6 +1614,10 @@ def render_history(records):
     target_values = {x['data']['inspection_target'] for x in records if site_key(x['data']['nome']) == site_key(site)}
     if len(target_values) > 1:
         st.warning('Il target ispettivo è cambiato nello storico: parte del trend può dipendere da questo cambiamento di criterio.')
+    scopes = {x['data'].get('input_scope', 'precedente') for x in records if site_key(x['data']['nome']) == site_key(site)}
+    if len(scopes) > 1:
+        st.warning('La versione 3.2 richiede le sole NC registrate o rilevate nel periodo. Le valutazioni precedenti '
+                   'possono includere arretrato aperto: verificare questo cambiamento di perimetro prima di interpretare il trend.')
     # Reindicizzazione per non collegare mesi mancanti e dividerli in segmenti.
     series = selected.set_index('Periodo').reindex(pd.date_range(selected['Periodo'].min(), selected['Periodo'].max(), freq='MS')).rename_axis('Periodo').reset_index()
     series['segmento'] = series['Indice'].isna().cumsum()
@@ -1378,6 +1661,10 @@ def render_comparison(records):
     if selected.empty:
         st.info('Nessuna valutazione con questi filtri.')
         return
+    scopes = {lookup[i]['data'].get('input_scope', 'precedente') for i in selected['id']}
+    if len(scopes) > 1:
+        st.warning('Sono presenti valutazioni con criteri temporali di inserimento diversi. La versione 3.2 considera '
+                   'le sole NC registrate o rilevate nel periodo; verificare l’omogeneità degli input prima del confronto.')
     st.altair_chart(alt.Chart(selected).mark_bar(cornerRadiusEnd=4, color='#225873').encode(
         x=alt.X('Indice:Q', scale=alt.Scale(domain=[0,100])), y=alt.Y('Cantiere:N', sort='-x'),
         tooltip=['Cantiere','Tecnologia','Indice','Livello']), width='stretch')
@@ -2128,3 +2415,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
